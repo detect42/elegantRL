@@ -1,0 +1,8 @@
+# Python 缓存 (对应 train/__pycache__ 等)
+__pycache__/
+
+# Mypy 类型检查缓存
+.mypy_cache/
+
+# VSCode 编辑器配置
+.vscode/

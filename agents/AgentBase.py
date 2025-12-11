@@ -6,9 +6,8 @@ from torch.nn.utils import clip_grad_norm_
 from typing import Union, Optional
 import random
 import torch.nn.functional as F
-from ..train import Config
 from ..train import ReplayBuffer
-
+from omegaconf import DictConfig, OmegaConf
 TEN = th.Tensor
 
 '''agent'''
@@ -25,26 +24,26 @@ class AgentBase:
     args: the arguments for agent training. `args = Config()`
     """
 
-    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
-        self.if_discrete: bool = args.if_discrete
-        self.if_off_policy: bool = args.if_off_policy
+    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None):
+        self.if_discrete: bool = args.env.if_discrete
+        self.if_off_policy: bool = args.model.if_off_policy
 
         self.net_dims = net_dims  # the networks dimension of each layer
         self.state_dim = state_dim  # feature number of state
         self.action_dim = action_dim  # feature number of continuous action or number of discrete action
 
-        self.gamma = args.gamma  # discount factor of future rewards
-        self.max_step = args.max_step  # limits the maximum number of steps an agent can take in a trajectory.
-        self.num_envs = args.num_envs  # the number of sub envs in vectorized env. `num_envs=1` in single env.
-        self.batch_size = args.batch_size  # num of transitions sampled from replay buffer.
-        self.repeat_times = args.repeat_times  # repeatedly update network using ReplayBuffer
-        self.reward_scale = args.reward_scale  # an approximate target reward usually be closed to 256
-        self.learning_rate = args.learning_rate  # the learning rate for network updating
-        self.if_off_policy = args.if_off_policy  # whether off-policy or on-policy of DRL algorithm
-        self.clip_grad_norm = args.clip_grad_norm  # clip the gradient after normalization
-        self.soft_update_tau = args.soft_update_tau  # the tau of soft target update `net = (1-tau)*net + net1`
-        self.state_value_tau = args.state_value_tau  # the tau of normalize for value and state
-        self.buffer_init_size = args.buffer_init_size  # train after samples over buffer_init_size for off-policy
+        self.gamma = args.train.gamma  # discount factor of future rewards
+        self.max_step = args.env.max_step  # limits the maximum number of steps an agent can take in a trajectory.
+        self.num_envs = args.env.num_envs  # the number of sub envs in vectorized env. `num_envs=1` in single env.
+        self.batch_size = args.train.batch_size  # num of transitions sampled from replay buffer.
+        self.repeat_times = args.train.repeat_times  # repeatedly update network using ReplayBuffer
+        self.reward_scale = args.train.reward_scale  # an approximate target reward usually be closed to 256
+        self.learning_rate = args.train.learning_rate  # the learning rate for network updating
+        self.if_off_policy = args.model.if_off_policy  # whether off-policy or on-policy of DRL algorithm
+        self.clip_grad_norm = args.train.clip_grad_norm  # clip the gradient after normalization
+        self.soft_update_tau = args.train.soft_update_tau  # the tau of soft target update `net = (1-tau)*net + net1`
+        self.state_value_tau = args.train.state_value_tau  # the tau of normalize for value and state
+        self.buffer_init_size = args.train.buffer_init_size  # train after samples over buffer_init_size for off-policy
 
         self.explore_noise_std = getattr(args, 'explore_noise_std', 0.05)  # standard deviation of exploration noise
         self.last_state: Optional[TEN] = None  # last state of the trajectory. shape == (num_envs, state_dim)

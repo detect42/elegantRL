@@ -3,31 +3,30 @@ import time
 import numpy as np
 import torch as th
 from typing import Tuple, List
-
-from .config import Config
+from omegaconf import DictConfig, OmegaConf
 
 TEN = th.Tensor
 
 
 class Evaluator:
-    def __init__(self, cwd: str, env, args: Config, if_tensorboard: bool = False):
+    def __init__(self, cwd: str, env, args: DictConfig, if_tensorboard: bool = False):
         self.cwd = cwd  # current working directory to save model
         self.env = env  # the env for Evaluator, `eval_env = env` in default
-        self.agent_id = args.gpu_id
+        self.agent_id = args.sys.gpu_id
         self.total_step = 0  # the total training step
         self.start_time = time.time()  # `used_time = time.time() - self.start_time`
-        self.eval_times = args.eval_times  # number of times that get episodic cumulative return
-        self.eval_per_step = args.eval_per_step  # evaluate the agent per training steps
+        self.eval_times = args.eval.times  # number of times that get episodic cumulative return
+        self.eval_per_step = args.eval.per_step  # evaluate the agent per training steps
         self.eval_step_counter = -self.eval_per_step  # `self.total_step > self.eval_step_counter + self.eval_per_step`
 
-        self.save_gap = args.save_gap
+        self.save_gap = args.eval.save_gap
         self.save_counter = 0
-        self.if_keep_save = args.if_keep_save
-        self.if_over_write = args.if_over_write
+        self.if_keep_save = args.eval.if_keep_save
+        self.if_over_write = args.eval.if_over_write
 
         self.recorder_path = f'{cwd}/recorder.npy'
         self.recorder = []  # total_step, r_avg, r_std, critic_value, ...
-        self.recorder_step = args.eval_record_step  # start recording after the exploration reaches this step.
+        self.recorder_step = args.eval.record_step  # start recording after the exploration reaches this step.
         self.max_r = -np.inf
         print("| Evaluator:"
               "\n| `step`: Number of samples, or total training steps, or running times of `env.step()`."
@@ -310,7 +309,7 @@ def draw_learning_curve(recorder: np.ndarray = None,
 """learning curve"""
 
 
-def demo_evaluator_actor_pth():
+"""def demo_evaluator_actor_pth():
     import gym
     from elegantrl.agents.AgentPPO import AgentPPO
     from elegantrl.train.config import Config, build_env
@@ -569,4 +568,4 @@ def run():
 
 if __name__ == '__main__':
     # demo_evaluate_actors()
-    run()
+    run()"""

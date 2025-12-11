@@ -2,9 +2,9 @@ import os
 import math
 import torch as th
 from typing import Tuple
-
-from .config import Config
-
+from typing import List, Optional
+from omegaconf import DictConfig, OmegaConf
+from typing import List, Optional
 TEN = th.Tensor
 
 
@@ -17,7 +17,7 @@ class ReplayBuffer:  # for off-policy
                  num_seqs: int = 1,
                  if_use_per: bool = False,
                  if_discrete: bool = False,
-                 args: Config = Config()):
+                 args: Optional[DictConfig] = None):
         self.p = 0  # pointer
         self.if_full = False
         self.cur_size = 0
@@ -64,8 +64,10 @@ class ReplayBuffer:  # for off-policy
         self.if_use_per = if_use_per
         if if_use_per:
             self.sum_trees = [SumTree(buf_len=max_size) for _ in range(num_seqs)]
-            self.per_alpha = getattr(args, 'per_alpha', 0.6)  # alpha = (Uniform:0, Greedy:1)
-            self.per_beta = getattr(args, 'per_beta', 0.4)  # alpha = (Uniform:0, Greedy:1)
+            #self.per_alpha = getattr(args, 'per_alpha', 0.6)  # alpha = (Uniform:0, Greedy:1)
+            self.per_alpha = args.train.get('per_alpha', 0.6)
+            #self.per_beta = getattr(args, 'per_beta', 0.4)  # alpha = (Uniform:0, Greedy:1)
+            self.per_beta = args.train.get('per_beta', 0.4)
             """PER.  Prioritized Experience Replay. Section 4
             alpha, beta = 0.7, 0.5 for rank-based variant
             alpha, beta = 0.6, 0.4 for proportional variant

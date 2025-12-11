@@ -6,9 +6,10 @@ from typing import List, Tuple
 import numpy as np
 import torch as th
 from torch import nn
-
-from ..train import Config, ReplayBuffer
+from typing import List, Optional
+from ..train import ReplayBuffer
 from .AgentBase import ActorBase, AgentBase, CriticBase, build_mlp, build_tcn, layer_init_with_orthogonal
+from omegaconf import DictConfig, OmegaConf
 
 TEN = th.Tensor
 
@@ -22,20 +23,21 @@ class AgentModSACDiscrete(AgentBase):
       - reliable_lambda + Two-time Update Rule
     """
 
-    def __init__(self, net_dims: List[int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
+    def __init__(
+        self, net_dims: List[int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None
+    ):
         super().__init__(net_dims, state_dim, action_dim, gpu_id, args)
-        use_tcn = getattr(args, "use_tcn", False)
-        K = getattr(args, "K", 1)
-        self.num_ensembles = getattr(args, "num_ensembles", 8)
-
-        self.critic_dropout = args.critic_dropout
-        self.L2_reg = args.L2_reg
-        self.state_noise_std = args.state_noise_std
-        self.emd_ch = args.emd_ch
+        use_tcn = args.model.use_tcn
+        K = args.env.K
+        self.num_ensembles = args.model.num_ensembles
+        self.critic_dropout = args.model.critic_dropout
+        self.L2_reg = args.train.L2_reg
+        self.state_noise_std = args.model.state_noise_std
+        self.emd_ch = args.model.emb_ch
 
         # 离散 Actor / Critic（注意：discrete critic 类）
-        temp_tau = getattr(args, "temp_tau", 1.0)
-        greedy_eps = getattr(args, "greedy_eps", 0.0)
+        temp_tau = args.model.temp_tau
+        greedy_eps = args.model.greedy_eps
 
         self.act = ActorDiscreteSAC(
             net_dims,
@@ -70,13 +72,13 @@ class AgentModSACDiscrete(AgentBase):
         default_target_H = -float(math.log(max(action_dim, 1)))
         self.alpha_log = th.tensor((-1.0,), dtype=th.float32, requires_grad=True, device=self.device)
         self.alpha_optim = th.optim.Adam((self.alpha_log,), lr=self.learning_rate)
-        self.target_entropy = getattr(args, "target_entropy", default_target_H)
+        self.target_entropy = args.get("target_entropy", default_target_H)
 
         # critic 稳定：Huber
         self.criterion = nn.SmoothL1Loss(reduction="none")
 
         # reliable_lambda
-        self.critic_tau = getattr(args, "critic_tau", 0.995)
+        self.critic_tau = args.get("critic_tau", 0.995)  # critic EMA
         self.critic_value = 1.0
         self.update_a = 0
 
@@ -330,7 +332,8 @@ class CriticEnsembleDiscrete(nn.Module):
         根据离散动作索引提取每个头对应的 Q(s,a)： [B, N]
         """
 
-        state_with_noise = state + self.state_noise_std * state * th.randn_like(state)
+        noise = th.randn_like(state).clamp(-2.0, 2.0)
+        state_with_noise = state + self.state_noise_std * state * noise
         Q_all = self.get_q_all(state_with_noise)  # [B,N,K]
         a = action_idx.long().view(-1, 1, 1)  # [B,1,1]
         Q_sa = Q_all.gather(dim=-1, index=a.expand(-1, Q_all.size(1), 1)).squeeze(-1)  # [B,N]

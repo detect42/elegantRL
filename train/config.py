@@ -5,129 +5,117 @@ import numpy as np
 import torch as th
 from dataclasses import dataclass, field
 from typing import Tuple, Type, Dict, Any, Optional
-import hydra
+import importlib
+from omegaconf import DictConfig, OmegaConf
 TEN = th.Tensor
 
 
-class Config:
-    def __init__(self, agent_class=None, env_class=None, env_args=None):
-        self.num_envs = None  # `num_envs==1` in a single environment. `num_envs > 1` in a vectorized environment.
-        self.agent_class = agent_class  # agent = agent_class(...)
-        self.if_off_policy = self.get_if_off_policy()  # whether off-policy or on-policy of DRL algorithm
-        print("self.if_off_policy:", self.if_off_policy)
-        print("agent_class:", agent_class)
-        if self.if_off_policy == True:
-           raise NotImplementedError("Off-policy algorithms are not supported in this version.")
-        """Argument of environment"""
-        self.env_class = env_class  # env = env_class(**env_args)
-        self.env_args = env_args  # env = env_class(**env_args)
-        if env_args is None:  # dummy env_args
-            env_args = {
-                "env_name": None,
-                "num_envs": 1,
-                "max_step": 12345,
-                "state_dim": None,
-                "action_dim": None,
-                "if_discrete": None,
-            }
-        env_args.setdefault("num_envs", 1)  # `num_envs=1` in default in single env.
-        env_args.setdefault("max_step", 12345)  # `max_step=12345` in default, which is a large enough value.
-        self.env_name = env_args["env_name"]  # the name of environment. Be used to set 'cwd'.
-        self.num_envs = env_args["num_envs"]  # the number of sub envs in vectorized env. `num_envs=1` in single env.
-        self.max_step = env_args["max_step"]  # the max step number of an episode. set as 12345 in default.
-        self.state_dim = env_args["state_dim"]  # vector dimension (feature number) of state
-        self.action_dim = env_args["action_dim"]  # vector dimension (feature number) of action
-        self.if_discrete = env_args["if_discrete"]  # discrete or continuous action space
+# ================================================================
+# 1. 纯逻辑处理：计算衍生参数，加载类
+# ================================================================
+def process_config(cfg: DictConfig) -> DictConfig:
+    """
+    负责对 Hydra 读入的原始配置进行必要的逻辑加工。
+    原则：
+    1. 不拍平 (No Flattening)：保持 cfg.train.lr 这种层级。
+    2. 不填默认值 (No Defaults)：Yaml 里没写的就报错。
+    """
 
-        """Arguments for reward shaping"""
-        self.gamma = 0.99  # discount factor of future rewards
-        self.reward_scale = 2**0  # an approximate target reward usually be closed to 256
+    # [Step 1] 解锁：允许写入新属性 (如 agent_class, state_dim)
+    OmegaConf.set_struct(cfg, False)
 
-        """Arguments for training"""
-        self.net_dims = [128, 128]  # the middle layer dimension of MLP (MultiLayer Perceptron)
-        self.learning_rate = 6e-5  # the learning rate for network updating
-        self.clip_grad_norm = 3.0  # 0.1 ~ 4.0, clip the gradient after normalization
-        self.state_value_tau = 0  # the tau of normalize for value and state `std = (1-std)*std + tau*std`
-        self.soft_update_tau = 5e-3  # 2 ** -8 ~= 5e-3. the tau of soft target update `net = (1-tau)*net + tau*net1`
-        self.continue_train = False  # continue train use last train saved models
-        if self.if_off_policy:  # off-policy
-            self.batch_size = int(64)  # num of transitions sampled from replay buffer.
-            self.horizon_len = int(512)  # collect horizon_len step while exploring, then update networks
-            self.buffer_size = int(1e6)  # ReplayBuffer size. First in first out for off-policy.
-            self.repeat_times = 1.0  # repeatedly update network using ReplayBuffer to keep critic's loss small
-            self.if_use_per = False  # use PER (Prioritized Experience Replay) for sparse reward
-            self.lambda_fit_cum_r = 0.0  # critic fits the mean of a batch cumulative rewards
-            self.buffer_init_size = int(self.batch_size * 8)  # train after samples over buffer_init_size for off-policy
-        else:  # on-policy
-            self.batch_size = int(128)  # num of transitions sampled from replay buffer.
-            self.horizon_len = int(2048)  # collect horizon_len step while exploring, then update network
-            self.buffer_size = None  # ReplayBuffer size. Empty the ReplayBuffer for on-policy.
-            self.repeat_times = 8.0  # repeatedly update network using ReplayBuffer to keep critic's loss small
-            self.if_use_vtrace = True  # use V-trace + GAE (Generalized Advantage Estimation) for sparse reward
-            self.buffer_init_size = None  # train after samples over buffer_init_size for off-policy
+    # [Step 2] 逻辑 A: 环境参数衍生计算
+    # 比如 state_dim = 15 * K
+    if cfg.env.get('state_dim') is None and cfg.env.get('K') is not None:
+        cfg.env.state_dim = 15 * cfg.env.K
+        print(f"| Config: Derived state_dim={cfg.env.state_dim}")
 
-        """Arguments for device"""
-        self.gpu_id = int(0)  # `int` means the ID of single GPU, -1 means CPU
-        self.num_workers = 2  # rollout workers number pre GPU (adjust it to get high GPU usage)
-        self.num_threads = 8  # cpu_num for pytorch, `th.set_num_threads(self.num_threads)`
-        self.random_seed = None  # initialize random seed in self.init_before_training(), None means set GPU_ID as seed
-        self.learner_gpu_ids = ()  # multiple gpu id Tuple[int, ...] for learners. () means single GPU or CPU.
+    # [Step 3] 逻辑 B: 自动推断 Off-policy
+    agent_name = cfg.model.agent_name
+    on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
+    # 如果名字里找不到 On-Policy 的关键词，那就是 Off-Policy
+    is_off_policy = all(name not in agent_name for name in on_policy_names)
+    cfg.model.if_off_policy = is_off_policy
 
-        """Arguments for evaluate"""
-        self.cwd = None  # current working directory to save model. None means set automatically
-        self.if_remove = True  # remove the cwd folder? (True, False, None:ask me)
-        self.break_step = np.inf  # break training if 'total_step > break_step'
-        self.break_score = np.inf  # break training if `cumulative_rewards > break_score`
-        self.if_keep_save = True  # keeping save the checkpoint. False means save until stop training.
-        self.if_over_write = False  # overwrite the best policy network. `self.cwd/actor.pth`
-        self.if_save_buffer = False  # if save the replay buffer for continuous training after stop training
+    """# [Step 4] 逻辑 C: 动态加载类对象
+    print(f"| Config: Loading Agent class: {cfg.model.agent_name}")
+    cfg.agent_class = get_class_from_path(cfg.model.agent_name)
 
-        self.save_gap = int(5)  # save actor f"{cwd}/actor_*.pth" for learning curve.
-        self.eval_times = int(3)  # number of times that get the average episodic cumulative return
-        self.eval_per_step = int(2e4)  # evaluate the agent per training steps
-        self.eval_env_class = None  # eval_env = eval_env_class(*eval_env_args)
-        self.eval_env_args = None  # eval_env = eval_env_class(*eval_env_args)
-        self.eval_record_step = 0  # evaluator start recording after the exploration reaches this step.
+    # 加载 Env Class (如果 yaml 里定义了 class_name)
+    if cfg.env.get('class_name'):
+        print(f"| Config: Loading Env class: {cfg.env.class_name}")
+        cfg.env_class = get_class_from_path(cfg.env.class_name)"""
 
-    def init_before_training(self):
-        if self.random_seed is None:
-            self.random_seed = max(0, self.gpu_id)
-        np.random.seed(self.random_seed)
-        th.manual_seed(self.random_seed)
-        th.set_num_threads(self.num_threads)
-        th.set_default_dtype(th.float32)
+    # [Step 5] 构造 env_args 字典 (为了兼容 gym 风格的初始化)
+    # 将 cfg.env 转换为纯 Python 字典，供环境类使用
+    cfg.env_args = OmegaConf.to_container(cfg.env, resolve=True)
+    cfg.env_args['env_name'] = cfg.env.name
 
-        """set cwd (current working directory) for saving model"""
-        if self.cwd is None:  # set cwd (current working directory) for saving model
-            self.cwd = f"./{self.env_name}_{self.agent_class.__name__[5:]}_{self.random_seed}"
+    # [Step 6] 关锁：处理完毕，禁止后续代码随意添加新 Key，防止拼写错误
+    OmegaConf.set_struct(cfg, True)
 
-        """remove history"""
-        if self.if_remove is None:
-            self.if_remove = bool(input(f"| Arguments PRESS 'y' to REMOVE: {self.cwd}? ") == "y")
-        if self.if_remove:
-            import shutil
+    return cfg
 
-            shutil.rmtree(self.cwd, ignore_errors=True)
-            print(f"| Arguments Remove cwd: {self.cwd}", flush=True)
+# ================================================================
+# 2. 副作用执行：初始化环境 (单独保留)
+# ================================================================
+def init_before_training(cfg: DictConfig):
+    """
+    执行全局设置：随机种子、PyTorch 线程、CWD 记录
+    """
+    # 1. 随机种子
+    seed = cfg.sys.random_seed
+    if seed is None:
+        seed = max(0, cfg.sys.gpu_id) # 默认用 GPU ID
+
+        # 因为我们之前关锁了，这里临时解锁修改一下 seed
+        OmegaConf.set_struct(cfg, False)
+        cfg.sys.random_seed = seed
+        OmegaConf.set_struct(cfg, True)
+
+    np.random.seed(seed)
+    th.manual_seed(seed)
+
+    # 2. PyTorch 线程
+    th.set_num_threads(cfg.sys.num_threads)
+    th.set_default_dtype(th.float32)
+
+    # 3. 记录 CWD (Current Working Directory)
+    # Hydra 已经切换了目录，这里记录一下供 Agent 保存模型用
+    current_log_dir = os.getcwd()
+
+    # 临时解锁写入 cwd
+    OmegaConf.set_struct(cfg, False)
+    cfg.eval.cwd = current_log_dir
+    OmegaConf.set_struct(cfg, True)
+
+    print(f"| Init: Seed={seed}, Threads={cfg.sys.num_threads}")
+    print(f"| Init: CWD={cfg.eval.cwd}")
+
+# ================================================================
+# 辅助工具
+# ================================================================
+def get_class_from_path(path: str):
+    """根据字符串路径加载类"""
+    try:
+        if '.' in path:
+            module_path, class_name = path.rsplit('.', 1)
+            module = importlib.import_module(module_path)
+            return getattr(module, class_name)
         else:
-            print(f"| Arguments Keep cwd: {self.cwd}", flush=True)
-        os.makedirs(self.cwd, exist_ok=True)
-
-    def get_if_off_policy(self) -> bool:
-        agent_name = self.agent_class.__name__ if self.agent_class else ""
-        on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
-        return all([agent_name.find(s) == -1 for s in on_policy_names])
-
-    def print_config(self):
-        from pprint import pprint
-
-        print(pprint(vars(self)), flush=True)  # prints out args in a neat, readable format
+            # 默认尝试从 elegantrl.agents 找
+            import elegantrl.agents
+            return getattr(elegantrl.agents, path)
+    except (ImportError, AttributeError) as e:
+        raise ImportError(f"Cannot import class: {path}. {e}")
 
 
-def build_env(env_class=None, env_args: dict = None, gpu_id: int = -1):
+def build_env(env_class=None, env_args: dict = {}, gpu_id: int = -1):
     import warnings
 
     warnings.filterwarnings("ignore", message=".*get variables from other wrappers is deprecated.*")
+    #print(env_args)
+    #print(type(env_args))
     env_args["gpu_id"] = gpu_id  # set gpu_id for vectorized env before build it
 
     if env_args.get("if_build_vec_env"):
