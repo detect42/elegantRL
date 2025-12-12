@@ -46,8 +46,8 @@ def train_agent_single_process(args: DictConfig):
     env = build_env(env_class, args.env_args, args.sys.gpu_id)
 
     """init agent"""
-    agent_class = get_class_from_path(args.model.agent_name)
-    agent = agent_class(args.model.net_dims, args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+    agent_class = get_class_from_path(args.agent.agent_name)
+    agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
     if args.train.continue_train:
         agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
@@ -64,7 +64,7 @@ def train_agent_single_process(args: DictConfig):
     agent.last_state = state.detach()
 
     """init buffer"""
-    if args.model.if_off_policy:
+    if args.agent.if_off_policy:
         buffer = ReplayBuffer(
             gpu_id=args.sys.gpu_id,
             num_seqs=args.env.num_envs,
@@ -89,7 +89,7 @@ def train_agent_single_process(args: DictConfig):
     cwd = args.eval.cwd
     break_step = args.train.break_step
     horizon_len = args.train.horizon_len
-    if_off_policy = args.model.if_off_policy
+    if_off_policy = args.agent.if_off_policy
     if_save_buffer = args.eval.if_save_buffer
 
     if_discrete = env.if_discrete
@@ -244,13 +244,13 @@ class Learner(Process):
             ValueError("| Learner: suggest to set `args.sys.learner_gpu_ids=()` in default")
 
         """Learner init agent"""
-        agent_class = get_class_from_path(args.model.agent_name)
-        agent = agent_class(args.model.net_dims, args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+        agent_class = get_class_from_path(args.agent.agent_name)
+        agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
         """Learner init buffer"""
-        if args.model.if_off_policy:
+        if args.agent.if_off_policy:
             buffer = ReplayBuffer(
                 gpu_id=args.sys.gpu_id,
                 num_seqs=args.env.num_envs * args.sys.num_workers * num_learners,
@@ -265,7 +265,7 @@ class Learner(Process):
             buffer = []
 
         """loop"""
-        if_off_policy = args.model.if_off_policy
+        if_off_policy = args.agent.if_off_policy
         if_discrete = args.env.if_discrete
         if_save_buffer = args.eval.if_save_buffer
 
@@ -397,9 +397,8 @@ class Worker(Process):
         env = build_env(env_class, args.env_args, args.sys.gpu_id)
 
         """init agent"""
-        agent_class = get_class_from_path(args.model.agent_name)
-        #print(agent_class)
-        agent = agent_class(args.model.net_dims, args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+        agent_class = get_class_from_path(args.agent.agent_name)
+        agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
@@ -508,7 +507,7 @@ def valid_agent(env_class, env_args: dict, net_dims: List[int], agent_class, act
 
     state_dim = env_args["state_dim"]
     action_dim = env_args["action_dim"]
-    agent = agent_class(net_dims, state_dim, action_dim, gpu_id=-1)
+    agent = agent_class(state_dim, action_dim, gpu_id=-1)
     actor = agent.act
 
     print(f"| render and load actor from: {actor_path}", flush=True)
@@ -523,7 +522,7 @@ def render_agent(env_class, env_args: dict, net_dims: [int], agent_class, actor_
 
     state_dim = env_args["state_dim"]
     action_dim = env_args["action_dim"]
-    agent = agent_class(net_dims, state_dim, action_dim, gpu_id=-1)
+    agent = agent_class(state_dim, action_dim, gpu_id=-1)
     actor = agent.act
     del agent
 

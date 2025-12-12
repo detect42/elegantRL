@@ -31,15 +31,15 @@ def process_config(cfg: DictConfig) -> DictConfig:
         print(f"| Config: Derived state_dim={cfg.env.state_dim}")
 
     # [Step 3] 逻辑 B: 自动推断 Off-policy
-    agent_name = cfg.model.agent_name
+    agent_name = cfg.agent.agent_name
     on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
     # 如果名字里找不到 On-Policy 的关键词，那就是 Off-Policy
     is_off_policy = all(name not in agent_name for name in on_policy_names)
-    cfg.model.if_off_policy = is_off_policy
+    cfg.agent.if_off_policy = is_off_policy
 
     """# [Step 4] 逻辑 C: 动态加载类对象
-    print(f"| Config: Loading Agent class: {cfg.model.agent_name}")
-    cfg.agent_class = get_class_from_path(cfg.model.agent_name)
+    print(f"| Config: Loading Agent class: {cfg.agent.agent_name}")
+    cfg.agent_class = get_class_from_path(cfg.agent.agent_name)
 
     # 加载 Env Class (如果 yaml 里定义了 class_name)
     if cfg.env.get('class_name'):

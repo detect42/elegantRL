@@ -17,18 +17,16 @@ class AgentBase:
     """
     The basic agent of ElegantRL
 
-    net_dims: the middle layer dimension of MLP (MultiLayer Perceptron)
     state_dim: the dimension of state (the number of state vector)
     action_dim: the dimension of action (or the number of discrete action)
     gpu_id: the gpu_id of the training device. Use CPU when cuda is not available.
     args: the arguments for agent training. `args = Config()`
     """
 
-    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None):
+    def __init__(self, state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None):
         self.if_discrete: bool = args.env.if_discrete
-        self.if_off_policy: bool = args.model.if_off_policy
+        self.if_off_policy: bool = args.agent.if_off_policy
 
-        self.net_dims = net_dims  # the networks dimension of each layer
         self.state_dim = state_dim  # feature number of state
         self.action_dim = action_dim  # feature number of continuous action or number of discrete action
 
@@ -39,13 +37,12 @@ class AgentBase:
         self.repeat_times = args.train.repeat_times  # repeatedly update network using ReplayBuffer
         self.reward_scale = args.train.reward_scale  # an approximate target reward usually be closed to 256
         self.learning_rate = args.train.learning_rate  # the learning rate for network updating
-        self.if_off_policy = args.model.if_off_policy  # whether off-policy or on-policy of DRL algorithm
+        self.if_off_policy = args.agent.if_off_policy  # whether off-policy or on-policy of DRL algorithm
         self.clip_grad_norm = args.train.clip_grad_norm  # clip the gradient after normalization
         self.soft_update_tau = args.train.soft_update_tau  # the tau of soft target update `net = (1-tau)*net + net1`
         self.state_value_tau = args.train.state_value_tau  # the tau of normalize for value and state
         self.buffer_init_size = args.train.buffer_init_size  # train after samples over buffer_init_size for off-policy
 
-        self.explore_noise_std = getattr(args, 'explore_noise_std', 0.05)  # standard deviation of exploration noise
         self.last_state: Optional[TEN] = None  # last state of the trajectory. shape == (num_envs, state_dim)
         self.device = th.device(f"cuda:{gpu_id}" if (th.cuda.is_available() and (gpu_id >= 0)) else "cpu")
 
@@ -74,7 +71,7 @@ class AgentBase:
             return self._explore_one_env(env=env, horizon_len=horizon_len)
 
     def explore_action(self, state: TEN) -> TEN:
-        return self.act.get_action(state, action_std=self.explore_noise_std)
+        return self.act.get_action(state)
 
     def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN]:
         """
@@ -314,7 +311,6 @@ class ActorBase(nn.Module):
 
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.explore_noise_std = None  # standard deviation of exploration action noise
         self.ActionDist = th.distributions.normal.Normal
 
     def forward(self, state: TEN) -> TEN:
