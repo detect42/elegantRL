@@ -43,7 +43,7 @@ def train_agent_single_process(args: DictConfig):
 
     """init environment"""
     env_class = get_class_from_path(args.env.class_name)
-    env = build_env(env_class, args.env_args, args.sys.gpu_id)
+    env = build_env(env_class, args.env, args.sys.gpu_id)
 
     """init agent"""
     agent_class = get_class_from_path(args.agent.agent_name)
@@ -81,8 +81,8 @@ def train_agent_single_process(args: DictConfig):
     """init evaluator"""
     eval_env_class = args.eval.env_class if args.eval.env_class else args.env_class
     eval_env_class = get_class_from_path(eval_env_class)
-    eval_env_args = args.eval.env_args if args.eval.env_args else args.env_args
-    eval_env = build_env(eval_env_class, eval_env_args, args.sys.gpu_id)
+    eval_env_cfg = args.eval.env if args.eval.env_class else args.env
+    eval_env = build_env(eval_env_class, eval_env_cfg, args.sys.gpu_id)
     evaluator = Evaluator(cwd=args.eval.cwd, env=eval_env, args=args, if_tensorboard=False)
 
     """train loop"""
@@ -320,7 +320,7 @@ class Learner(Process):
             """COMMUNICATE between Learners: Learner send actor to other Learners"""
             _buffer_len = num_envs * num_workers
             _buffer_items_tensor = [t[:, :_buffer_len].cpu().detach() for t in buffer_items_tensor]
-            for shift_id in range(num_communications):
+            for shift_id in range(num_communications): #! 这里shift_id在循环内部没用？
                 _learner_pipe = self.learners_pipe[learner_id][0]
                 _learner_pipe.send(_buffer_items_tensor)
             """COMMUNICATE between Learners: Learner receive (buffer_items, last_state) from other Learners"""
@@ -394,7 +394,7 @@ class Worker(Process):
         """init environment"""
         env_class = get_class_from_path(args.env.class_name)
         #print(env_class)
-        env = build_env(env_class, args.env_args, args.sys.gpu_id)
+        env = build_env(env_class, args.env, args.sys.gpu_id)
 
         """init agent"""
         agent_class = get_class_from_path(args.agent.agent_name)
@@ -455,8 +455,8 @@ class EvaluatorProc(Process):
         """init evaluator"""
         eval_env_class_name = args.eval.env.class_name if args.eval.env.class_name else args.env.class_name
         eval_env_class = get_class_from_path(eval_env_class_name)
-        eval_env_args = args.eval.env_args if args.eval.env.class_name else args.env_args
-        eval_env = build_env(eval_env_class, eval_env_args, args.sys.gpu_id)
+        eval_env_cfg = args.eval.env if args.eval.env.class_name else args.env
+        eval_env = build_env(eval_env_class, eval_env_cfg, args.sys.gpu_id)
         evaluator = Evaluator(cwd=args.eval.cwd, env=eval_env, args=args, if_tensorboard=True)
 
         """loop"""
@@ -502,11 +502,11 @@ class EvaluatorProc(Process):
 """render"""
 
 
-def valid_agent(env_class, env_args: dict, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8):
-    env = build_env(env_class, env_args)
+def valid_agent(env_class, env_cfg: DictConfig, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8):
+    env = build_env(env_class, env_cfg)
 
-    state_dim = env_args["state_dim"]
-    action_dim = env_args["action_dim"]
+    state_dim = env_cfg.state_dim
+    action_dim = env_cfg.action_dim
     agent = agent_class(state_dim, action_dim, gpu_id=-1)
     actor = agent.act
 
@@ -517,11 +517,11 @@ def valid_agent(env_class, env_args: dict, net_dims: List[int], agent_class, act
         print(f"|{i:4}  cumulative_reward {cumulative_reward:9.3f}  episode_step {episode_step:5.0f}", flush=True)
 
 
-def render_agent(env_class, env_args: dict, net_dims: [int], agent_class, actor_path: str, render_times: int = 8):
-    env = build_env(env_class, env_args)
+def render_agent(env_class, env_cfg: DictConfig, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8):
+    env = build_env(env_class, env_cfg)
 
-    state_dim = env_args["state_dim"]
-    action_dim = env_args["action_dim"]
+    state_dim = env_cfg.state_dim
+    action_dim = env_cfg.action_dim
     agent = agent_class(state_dim, action_dim, gpu_id=-1)
     actor = agent.act
     del agent

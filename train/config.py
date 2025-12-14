@@ -37,21 +37,7 @@ def process_config(cfg: DictConfig) -> DictConfig:
     is_off_policy = all(name not in agent_name for name in on_policy_names)
     cfg.agent.if_off_policy = is_off_policy
 
-    """# [Step 4] 逻辑 C: 动态加载类对象
-    print(f"| Config: Loading Agent class: {cfg.agent.agent_name}")
-    cfg.agent_class = get_class_from_path(cfg.agent.agent_name)
-
-    # 加载 Env Class (如果 yaml 里定义了 class_name)
-    if cfg.env.get('class_name'):
-        print(f"| Config: Loading Env class: {cfg.env.class_name}")
-        cfg.env_class = get_class_from_path(cfg.env.class_name)"""
-
-    # [Step 5] 构造 env_args 字典 (为了兼容 gym 风格的初始化)
-    # 将 cfg.env 转换为纯 Python 字典，供环境类使用
-    cfg.env_args = OmegaConf.to_container(cfg.env, resolve=True)
-    cfg.env_args['env_name'] = cfg.env.name
-
-    # [Step 6] 关锁：处理完毕，禁止后续代码随意添加新 Key，防止拼写错误
+    # [Step 4] 关锁：处理完毕，禁止后续代码随意添加新 Key，防止拼写错误
     OmegaConf.set_struct(cfg, True)
 
     return cfg
@@ -110,29 +96,23 @@ def get_class_from_path(path: str):
         raise ImportError(f"Cannot import class: {path}. {e}")
 
 
-def build_env(env_class=None, env_args: dict = {}, gpu_id: int = -1):
+def build_env(env_class=None, cfg: Optional[DictConfig] = None, gpu_id: int = -1):
     import warnings
 
     warnings.filterwarnings("ignore", message=".*get variables from other wrappers is deprecated.*")
-    #print(env_args)
-    #print(type(env_args))
-    env_args["gpu_id"] = gpu_id  # set gpu_id for vectorized env before build it
+    #env_args["gpu_id"] = gpu_id  # set gpu_id for vectorized env before build it
 
-    if env_args.get("if_build_vec_env"):
-        num_envs = env_args["num_envs"]
-        env = VecEnv(env_class=env_class, env_args=env_args, num_envs=num_envs, gpu_id=gpu_id)
+    if cfg.if_build_vec_env:
+        env = VecEnv(env_class=env_class, cfg = cfg, gpu_id=gpu_id)
     elif env_class.__module__ == "gymnasium.envs.registration":
-        env = env_class(id=env_args["env_name"])
+        env = env_class(id=cfg.env_name)
     else:
-        env = env_class(**kwargs_filter(env_class.__init__, env_args.copy()))
+        env = env_class(cfg)
 
-    env_args.setdefault("num_envs", 1)
-    env_args.setdefault("max_step", 12345)
 
     for attr_str in ("env_name", "num_envs", "max_step", "state_dim", "action_dim", "if_discrete"):
-        setattr(env, attr_str, env_args[attr_str])
+        assert hasattr(env, attr_str), f"Environment missing required attribute: {attr_str}"
     return env
-
 
 def kwargs_filter(function, kwargs: dict) -> dict:
     import inspect
@@ -207,20 +187,20 @@ def get_gym_env_args(env, if_print: bool) -> dict:
     if if_print:
         env_args_str = repr(env_args).replace(",", f",\n{'':11}")
         print(f"env_args = {env_args_str}", flush=True)
-    return env_args
-
+    cfg = DictConfig(env_args)
+    return cfg
 
 """vectorized env"""
 
 
 class SubEnv(Process):
-    def __init__(self, sub_pipe0: Pipe, vec_pipe1: Pipe, env_class, env_args: dict, env_id: int = 0):
+    def __init__(self, sub_pipe0: Pipe, vec_pipe1: Pipe, env_class, cfg: DictConfig, env_id: int = 0):
         super().__init__()
         self.sub_pipe0 = sub_pipe0
         self.vec_pipe1 = vec_pipe1
 
         self.env_class = env_class
-        self.env_args = env_args
+        self.cfg = cfg
         self.env_id = env_id
 
     def run(self):
@@ -228,9 +208,9 @@ class SubEnv(Process):
 
         """build env"""
         if self.env_class.__module__ == "gymnasium.envs.registration":  # is standard OpenAI Gym env
-            env = self.env_class(id=self.env_args["env_name"])
+            env = self.env_class(id=self.cfg.env_name)
         else:
-            env = self.env_class(**kwargs_filter(self.env_class.__init__, self.env_args.copy()))
+            env = self.env_class(self.cfg)
 
         """set env random seed"""
         random_seed = self.env_id
@@ -251,17 +231,16 @@ class SubEnv(Process):
 
 
 class VecEnv:
-    def __init__(self, env_class: object, env_args: dict, num_envs: int, gpu_id: int = -1):
+    def __init__(self, env_class: object, cfg: DictConfig, gpu_id: int = -1):
         self.device = th.device(f"cuda:{gpu_id}" if (th.cuda.is_available() and (gpu_id >= 0)) else "cpu")
-        self.num_envs = num_envs  # the number of sub env in vectorized env.
+        self.num_envs = cfg.num_envs  # the number of sub env in vectorized env.
 
         """the necessary env information when you design a custom env"""
-        self.env_name = env_args["env_name"]  # the name of this env.
-        self.max_step = env_args["max_step"]  # the max step number in an episode for evaluation
-        self.state_dim = env_args["state_dim"]  # feature number of state
-        self.action_dim = env_args["action_dim"]  # feature number of action
-        self.if_discrete = env_args["if_discrete"]  # discrete action or continuous action
-
+        self.env_name = cfg.env_name  # the name of this env.
+        self.max_step = cfg.max_step  # the max step number in an episode for evaluation
+        self.state_dim = cfg.state_dim  # feature number of state
+        self.action_dim = cfg.action_dim  # feature number of action
+        self.if_discrete = cfg.if_discrete  # discrete action or continuous action
         """speed up with multiprocessing: Process, Pipe"""
         assert self.num_envs <= 64
         self.res_list = [[] for _ in range(self.num_envs)]
@@ -273,13 +252,12 @@ class VecEnv:
         self.vec_pipe0 = vec_pipe0
 
         self.sub_envs = [
-            SubEnv(sub_pipe0=sub_pipe0, vec_pipe1=vec_pipe1, env_class=env_class, env_args=env_args, env_id=env_id)
+            SubEnv(sub_pipe0=sub_pipe0, vec_pipe1=vec_pipe1, env_class=env_class, cfg=cfg, env_id=env_id)
             for env_id, sub_pipe0 in enumerate(sub_pipe0s)
         ]
 
         [setattr(p, "daemon", True) for p in self.sub_envs]  # set before process start to exit safely
         [p.start() for p in self.sub_envs]
-
     def reset(self) -> Tuple[TEN, dict]:  # reset the agent in env
         th.set_grad_enabled(False)
 
@@ -327,8 +305,9 @@ def check_vec_env():
         "action_dim": 2,
         "if_discrete": True,
     }
+    cfg = DictConfig(env_args)
 
-    env = VecEnv(env_class=env_class, env_args=env_args, num_envs=num_envs, gpu_id=gpu_id)
+    env = VecEnv(env_class=env_class, cfg=cfg, num_envs=num_envs, gpu_id=gpu_id)
 
     device = th.device(f"cuda:{gpu_id}" if (th.cuda.is_available() and (gpu_id >= 0)) else "cpu")
     state, info_dict = env.reset()
