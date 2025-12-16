@@ -1,15 +1,15 @@
 import math
 import random
 from copy import deepcopy
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch as th
+from omegaconf import DictConfig, OmegaConf
 from torch import nn
-from typing import List, Optional
+
 from ..train import ReplayBuffer
 from .AgentBase import ActorBase, AgentBase, CriticBase, build_mlp, build_tcn, layer_init_with_orthogonal
-from omegaconf import DictConfig, OmegaConf
 
 TEN = th.Tensor
 
@@ -201,8 +201,6 @@ class ActorDiscreteSAC(ActorBase):
 
     def policy(self, state: TEN) -> Tuple[TEN, TEN]:
         logits = self._logits(state)  # [B,K]
-        if random.random() < 0.00001:
-            print("logits:", logits)
 
         tau = max(self.temp_tau, 1e-6)
         probs = th.softmax(th.clamp(logits, -20.0, 20.0) / tau, dim=-1)
@@ -218,10 +216,12 @@ class ActorDiscreteSAC(ActorBase):
 
     def get_action(self, state: TEN) -> TEN:
         probs, _ = self.policy(state)
-        if random.random() < 0.00002:
-            print(probs)
+
         dist = th.distributions.Categorical(probs=probs)
         action_idx = dist.sample()  # [B]
+
+        if random.random() < 0.000004:
+            print("logits:", self._logits(state).detach().cpu().numpy(), " probs:", probs.detach().cpu().numpy(), " action_idx:", action_idx.item())
         return action_idx
 
     def get_action_logprob(self, state: TEN) -> Tuple[TEN, TEN]:

@@ -27,7 +27,7 @@ def process_config(cfg: DictConfig) -> DictConfig:
     # [Step 2] 逻辑 A: 环境参数衍生计算
     # 比如 state_dim = 15 * K
     if cfg.env.get('state_dim') is None and cfg.env.get('K') is not None:
-        cfg.env.state_dim = 15 * cfg.env.K
+        cfg.env.state_dim = 8 * cfg.env.K
         print(f"| Config: Derived state_dim={cfg.env.state_dim}")
 
     # [Step 3] 逻辑 B: 自动推断 Off-policy

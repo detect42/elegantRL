@@ -53,7 +53,7 @@ class Evaluator:
             self.tensorboard = None
 
     def evaluate_and_save(self, actor: th.nn, steps: int, exp_r: float, logging_tuple: tuple):
-        print("now_steps=",self.total_step,"eval_step_counter= ",self.eval_step_counter," target_steps:",self.eval_step_counter + self.eval_per_step, " add steps->",steps," exp_r->",exp_r,flush=True)
+        #print("now_steps=",self.total_step,"eval_step_counter= ",self.eval_step_counter," target_steps:",self.eval_step_counter + self.eval_per_step, " add steps->",steps," exp_r->",exp_r,flush=True)
 
         self.total_step += steps  # update total training steps
 
@@ -61,7 +61,6 @@ class Evaluator:
             return
         if self.total_step < self.eval_step_counter + self.eval_per_step:
             return
-        print("!!!!!!")
         self.eval_step_counter = self.total_step
 
         rewards_step_ten = self.get_cumulative_rewards_and_step(actor)
@@ -131,9 +130,7 @@ class Evaluator:
         elif os.path.exists(self.recorder_path):
             recorder = np.load(self.recorder_path)
             self.recorder = [tuple(i) for i in recorder]  # convert numpy to list
-            print("!@#",self.total_step)
             self.total_step = self.recorder[-1][0]
-            print("#@!",self.total_step)
 
     def get_cumulative_rewards_and_step_single_env(self, actor) -> TEN:
         rewards_steps_list = [get_rewards_and_steps(self.env, actor) for _ in range(self.eval_times)]
