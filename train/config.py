@@ -1,12 +1,14 @@
+import importlib
 import os
-from multiprocessing import Pipe, Process
 import time
+from dataclasses import dataclass, field
+from multiprocessing import Pipe, Process
+from typing import Any, Dict, Optional, Tuple, Type
+
 import numpy as np
 import torch as th
-from dataclasses import dataclass, field
-from typing import Tuple, Type, Dict, Any, Optional
-import importlib
 from omegaconf import DictConfig, OmegaConf
+
 TEN = th.Tensor
 
 
@@ -26,10 +28,11 @@ def process_config(cfg: DictConfig) -> DictConfig:
 
     # [Step 2] 逻辑 A: 环境参数衍生计算
     # 比如 state_dim = 15 * K
-    if cfg.env.get('state_dim') is None and cfg.env.get('K') is not None:
-        cfg.env.state_dim = 8 * cfg.env.K
+    if cfg.env.get('K') is not None:
+        cfg.env.state_dim = cfg.env.state_dim * cfg.env.K
         print(f"| Config: Derived state_dim={cfg.env.state_dim}")
-
+    cfg.env.gpu_id = cfg.sys.gpu_id
+    cfg.eval.env.gpu_id = cfg.sys.gpu_id
     # [Step 3] 逻辑 B: 自动推断 Off-policy
     agent_name = cfg.agent.agent_name
     on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
