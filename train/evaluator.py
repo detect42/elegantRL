@@ -1,11 +1,60 @@
 import os
 import time
+from typing import List, Tuple
+import time
 import numpy as np
 import torch as th
-from typing import Tuple, List
 from omegaconf import DictConfig, OmegaConf
+from threadpoolctl import threadpool_limits
 
 TEN = th.Tensor
+
+
+def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
+    """
+    运行在子进程中的评测逻辑
+    """
+    th.set_num_threads(1)
+
+    with threadpool_limits(limits=4, user_api="blas"):
+        # 确保 actor 在 CPU 上，并且是评估模式
+        actor_cpu.eval()
+
+        results = []
+
+        # 为了避免每次 step 都创建 tensor 的开销，预先定义好 device
+        device = th.device(device_type)
+
+        with th.no_grad():
+            for set_id in case_ids:
+                # print(set_id)
+                # === 核心修改：传入 seq 参数 ===
+                # 假设您的 env.reset 支持 seq 参数
+                state, _ = env.reset(set_id=set_id, eval_mode=True)
+
+                cumulative_returns = 0.0
+                episode_steps = 0
+
+                for _ in range(max_step):
+                    # 转 Tensor
+                    tensor_state = th.as_tensor(state, dtype=th.float32, device=device).unsqueeze(0)
+
+                    # 推理 (Batch=1, CPU)
+                    tensor_action = actor_cpu(tensor_state)
+                    action = tensor_action.detach().numpy()[0]  # 已经是 CPU 了
+
+                    # 环境交互
+                    state, reward, terminated, truncated, _ = env.step(action)
+                    cumulative_returns += reward
+                    episode_steps += 1
+
+                    if terminated or truncated:
+                        break
+
+                # 记录结果 (reward, step)
+                results.append((cumulative_returns, episode_steps))
+
+    return results
 
 
 class Evaluator:
@@ -24,36 +73,43 @@ class Evaluator:
         self.if_keep_save = args.eval.if_keep_save
         self.if_over_write = args.eval.if_over_write
 
-        self.recorder_path = f'{cwd}/recorder.npy'
+        self.recorder_path = f"{cwd}/recorder.npy"
         self.recorder = []  # total_step, r_avg, r_std, critic_value, ...
         self.recorder_step = args.eval.record_step  # start recording after the exploration reaches this step.
         self.max_r = -np.inf
-        print("| Evaluator:"
-              "\n| `step`: Number of samples, or total training steps, or running times of `env.step()`."
-              "\n| `time`: Time spent from the start of training to this moment."
-              "\n| `avgR`: Average value of cumulative rewards, which is the sum of rewards in an episode."
-              "\n| `stdR`: Standard dev of cumulative rewards, which is the sum of rewards in an episode."
-              "\n| `avgS`: Average of steps in an episode."
-              "\n| `objC`: Objective of Critic network. Or call it loss function of critic network."
-              "\n| `objA`: Objective of Actor network. It is the average Q value of the critic network."
-              f"\n{'#' * 80}\n"
-              f"{'ID':<3}{'Step':>8}{'Time':>8} |"
-              f"{'avgR':>8}{'stdR':>7}{'avgS':>7}{'stdS':>6} |"
-              f"{'expR':>8}{'objC':>7}{'objA':>7}{'etc.':>7}", flush=True)
-
-        if getattr(env, 'num_envs', 1) == 1:  # get attribute
+        print(
+            "| Evaluator:"
+            "\n| `step`: Number of samples, or total training steps, or running times of `env.step()`."
+            "\n| `time`: Time spent from the start of training to this moment."
+            "\n| `avgR`: Average value of cumulative rewards, which is the sum of rewards in an episode."
+            "\n| `stdR`: Standard dev of cumulative rewards, which is the sum of rewards in an episode."
+            "\n| `avgS`: Average of steps in an episode."
+            "\n| `objC`: Objective of Critic network. Or call it loss function of critic network."
+            "\n| `objA`: Objective of Actor network. It is the average Q value of the critic network."
+            f"\n{'#' * 80}\n"
+            f"{'ID':<3}{'Step':>8}{'Time':>8} |"
+            f"{'avgR':>8}{'stdR':>7}{'avgS':>7}{'stdS':>6} |"
+            f"{'expR':>8}{'objC':>7}{'objA':>7}{'etc.':>7}",
+            flush=True,
+        )
+        assert type(env.num_envs) == int and env.num_envs >= 1
+        if args.eval.eval_dataset_test_all:
+            self.get_cumulative_rewards_and_step = self.get_cumulative_rewards_and_step_single_env_parallel
+        elif env.num_envs == 1:  # get attribute
             self.get_cumulative_rewards_and_step = self.get_cumulative_rewards_and_step_single_env
         else:  # vectorized environment
+            print("Evaluator: Vectorized Env Num =", env.num_envs, flush=True)
             self.get_cumulative_rewards_and_step = self.get_cumulative_rewards_and_step_vectorized_env
 
         if if_tensorboard:
             from torch.utils.tensorboard import SummaryWriter
+
             self.tensorboard = SummaryWriter(f"{cwd}/tensorboard")
         else:
             self.tensorboard = None
 
     def evaluate_and_save(self, actor: th.nn, steps: int, exp_r: float, logging_tuple: tuple):
-        #print("now_steps=",self.total_step,"eval_step_counter= ",self.eval_step_counter," target_steps:",self.eval_step_counter + self.eval_per_step, " add steps->",steps," exp_r->",exp_r,flush=True)
+        # print("now_steps=",self.total_step,"eval_step_counter= ",self.eval_step_counter," target_steps:",self.eval_step_counter + self.eval_per_step, " add steps->",steps," exp_r->",exp_r,flush=True)
 
         self.total_step += steps  # update total training steps
 
@@ -62,9 +118,8 @@ class Evaluator:
         if self.total_step < self.eval_step_counter + self.eval_per_step:
             return
         self.eval_step_counter = self.total_step
-
         rewards_step_ten = self.get_cumulative_rewards_and_step(actor)
-
+        print(rewards_step_ten.shape, flush=True)  # p
         returns = rewards_step_ten[:, 0]  # episodic cumulative returns of an
         steps = rewards_step_ten[:, 1]  # episodic step number
         avg_r = returns.mean().item()
@@ -76,7 +131,7 @@ class Evaluator:
         value_tuple = [v for v in logging_tuple if isinstance(v, (int, float))]
         logging_str = logging_tuple[-1]
 
-        '''record the training information'''
+        """record the training information"""
         self.recorder.append((self.total_step, avg_r, std_r, exp_r, *value_tuple))  # update recorder
         if self.tensorboard:
             self.tensorboard.add_scalar("info/critic_loss_sample", value_tuple[0], self.total_step)
@@ -91,12 +146,15 @@ class Evaluator:
             self.tensorboard.add_scalar("reward/std_reward_time", std_r, train_time)
             self.tensorboard.add_scalar("reward/exp_reward_time", exp_r, train_time)
 
-        '''print some information to Terminal'''
+        """print some information to Terminal"""
         prev_max_r = self.max_r
         self.max_r = max(self.max_r, avg_r)  # update max average cumulative rewards
-        print(f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} |"
-              f"{avg_r:8.2f}{std_r:7.1f}{avg_s:7.0f}{std_s:6.0f} |"
-              f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in value_tuple)} {logging_str}", flush=True)
+        print(
+            f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} |"
+            f"{avg_r:8.2f}{std_r:7.1f}{avg_s:7.0f}{std_s:6.0f} |"
+            f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in value_tuple)} {logging_str}",
+            flush=True,
+        )
 
         if_save = avg_r > prev_max_r
         if if_save:
@@ -138,11 +196,17 @@ class Evaluator:
         return rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
 
     def get_cumulative_rewards_and_step_vectorized_env(self, actor) -> TEN:
-        rewards_step_list = [get_cumulative_rewards_and_step_from_vec_env(self.env, actor)
-                             for _ in range(max(1, self.eval_times // self.env.num_envs))]
+        rewards_step_list = [
+            get_cumulative_rewards_and_step_from_vec_env(self.env, actor)
+            for _ in range(max(1, self.eval_times // self.env.num_envs))
+        ]
         rewards_step_list = sum(rewards_step_list, [])
         rewards_step_ten = th.tensor(rewards_step_list)
         return rewards_step_ten  # rewards_steps_ten.shape[1] == 2
+
+    def get_cumulative_rewards_and_step_single_env_parallel(self, actor) -> TEN:
+        rewards_steps_ten = get_cumulative_rewards_and_step_single_env_parallel(self.env, actor)
+        return rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
 
     def save_training_curve_jpg(self):
         recorder = np.array(self.recorder)
@@ -182,7 +246,7 @@ def get_rewards_and_steps(env, actor, if_render: bool = False) -> Tuple[float, i
         tensor_state = th.as_tensor(state, dtype=th.float32, device=device).unsqueeze(0)
         tensor_action = actor(tensor_state)
         action = tensor_action.detach().cpu().numpy()[0]  # not need detach(), because using th.no_grad() outside
-        #print("eval:",action)
+        # print("eval:",action)
         state, reward, terminated, truncated, _ = env.step(action)
         cumulative_returns += reward
 
@@ -193,8 +257,8 @@ def get_rewards_and_steps(env, actor, if_render: bool = False) -> Tuple[float, i
     else:
         print("| get_rewards_and_step: WARNING. max_step > 12345", flush=True)
 
-    env_unwrapped = getattr(env, 'unwrapped', env)
-    cumulative_returns = getattr(env_unwrapped, 'cumulative_returns', cumulative_returns)
+    env_unwrapped = getattr(env, "unwrapped", env)
+    cumulative_returns = getattr(env_unwrapped, "cumulative_returns", cumulative_returns)
     return cumulative_returns, episode_steps + 1
 
 
@@ -202,21 +266,21 @@ def get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float
     device = env.device
     env_num = env.num_envs
     max_step = env.max_step
-    '''get returns and dones (GPU)'''
+    """get returns and dones (GPU)"""
     returns = th.empty((max_step, env_num), dtype=th.float32, device=device)
     dones = th.empty((max_step, env_num), dtype=th.bool, device=device)
 
     state, info_dict = env.reset()  # must reset in vectorized env
+    # print(state)
     for t in range(max_step):
         action = actor(state.to(device))
-        # assert action.shape == (num_envs, ) if if_discrete else (num_envs, action_dim)
+        assert action.shape == (env_num,) if env.if_discrete else (env_num, env.action_dim)
         state, reward, terminal, truncate, info_dict = env.step(action)
-
         returns[t] = reward
         dones[t] = th.logical_or(terminal, truncate)
 
-    '''get cumulative returns and step'''
-    if hasattr(env, 'cumulative_returns'):  # GPU
+    """get cumulative returns and step"""
+    if hasattr(env, "cumulative_returns"):  # GPU
         returns_step_list = [(ret, env.max_step) for ret in env.cumulative_returns]
     else:  # CPU
         returns = returns.cpu()
@@ -239,9 +303,69 @@ def get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float
     return returns_step_list
 
 
-def draw_learning_curve(recorder: np.ndarray = None,
-                        fig_title: str = 'learning_curve',
-                        save_path: str = 'learning_curve.jpg'):
+def get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> TEN:
+    import multiprocessing
+    from copy import deepcopy
+
+    import numpy as np
+
+    # 1. 准备配置
+    num_workers = env.eval_num_workers
+    total_times = env.eval_pool_size  # 总评测次数 (例如 14w)
+    #total_times = 1000
+    # 2. 生成所有任务 ID (假设 ID 是从 0 到 total_times-1)
+    all_ids = np.arange(total_times)
+
+    # 3. 将任务 ID 切分为 chunks 分发给 Worker
+    # np.array_split 会自动处理不能整除的情况
+    chunks = np.array_split(all_ids, num_workers)
+
+    # 4. 准备 Actor (必须转到 CPU !)
+    # GPU 模型在多进程 Fork/Spawn 时极易出错且效率低 (Batch=1时)
+    actor_cpu = deepcopy(actor).to("cpu")
+    actor_cpu.eval()  # 确保是评估模式
+
+    # 5. 准备 Environment
+    # 注意：如果 self.env 包含不可序列化的对象（如 C++ 指针、打开的文件句柄），
+    # 这里直接传 self.env 会报错。
+    # 如果报错，您需要改为传递 env_class 和 env_args 在子进程内重建环境。
+    # 这里假设您的 env 是可以 pickle 的。
+    env_copy = deepcopy(env)
+    t0 = time.time()
+    # 6. 组装参数
+    # (actor, env, ids, max_step, device)
+    worker_args = [(actor_cpu, env_copy, chunk, env.max_step, "cpu") for chunk in chunks]
+
+    # 7. 启动并行池
+    # 使用 'spawn' 模式通常比 'fork' 更安全，特别是涉及 PyTorch 时
+    # 但 'fork' 在 Linux 上启动更快。如果遇到死锁，请改用 get_context('spawn')
+    try:
+        ctx = multiprocessing.get_context("fork")  # Linux 推荐尝试 fork，不行再 spawn
+    except:
+        ctx = multiprocessing.get_context("spawn")  # Windows 或 fallback
+
+    with ctx.Pool(processes=num_workers) as pool:
+        # starmap 会自动解包参数传给 _eval_worker
+        results_nested = pool.starmap(_eval_worker, worker_args)
+
+    # 8. 结果合并
+    # results_nested 是 [[(r,s), (r,s)...], [(r,s)...]] 的结构
+    flat_results = [item for sublist in results_nested for item in sublist]
+
+    # 9. 转换为 Tensor 返回
+    # 形状应该是 (total_times, 2)
+    rewards_steps_ten = th.tensor(flat_results, dtype=th.float32)
+
+    t1 = time.time()
+    total_time = t1 - t0
+    print(f"| Eval Time Cost: {total_time:.2f} seconds", flush=True)
+
+    return rewards_steps_ten
+
+
+def draw_learning_curve(
+    recorder: np.ndarray = None, fig_title: str = "learning_curve", save_path: str = "learning_curve.jpg"
+):
     steps = recorder[:, 0]  # x-axis is training steps
     r_avg = recorder[:, 1]
     r_std = recorder[:, 2]
@@ -249,57 +373,69 @@ def draw_learning_curve(recorder: np.ndarray = None,
     obj_c = recorder[:, 4]
     obj_a = recorder[:, 5]
 
-    '''plot subplots'''
+    """plot subplots"""
     import matplotlib as mpl
-    mpl.use('Agg')
+
+    mpl.use("Agg")
     """Generating matplotlib graphs without a running X server [duplicate]
     write `mpl.use('Agg')` before `import matplotlib.pyplot as plt`
     https://stackoverflow.com/a/4935945/9293137
     """
 
     import matplotlib.pyplot as plt
+
     fig, axs = plt.subplots(2)
 
-    '''axs[0]'''
+    """axs[0]"""
     ax00 = axs[0]
     ax00.cla()
 
     ax01 = axs[0].twinx()
-    color01 = 'darkcyan'
-    ax01.set_ylabel('Explore AvgReward', color=color01)
-    ax01.plot(steps, r_exp, color=color01, alpha=0.5, )
-    ax01.tick_params(axis='y', labelcolor=color01)
+    color01 = "darkcyan"
+    ax01.set_ylabel("Explore AvgReward", color=color01)
+    ax01.plot(
+        steps,
+        r_exp,
+        color=color01,
+        alpha=0.5,
+    )
+    ax01.tick_params(axis="y", labelcolor=color01)
 
-    color0 = 'lightcoral'
-    ax00.set_ylabel('Episode Return', color=color0)
-    ax00.plot(steps, r_avg, label='Episode Return', color=color0)
+    color0 = "lightcoral"
+    ax00.set_ylabel("Episode Return", color=color0)
+    ax00.plot(steps, r_avg, label="Episode Return", color=color0)
     ax00.fill_between(steps, r_avg - r_std, r_avg + r_std, facecolor=color0, alpha=0.3)
     ax00.grid()
-    '''axs[1]'''
+    """axs[1]"""
     ax10 = axs[1]
     ax10.cla()
 
     ax11 = axs[1].twinx()
-    color11 = 'darkcyan'
-    ax11.set_ylabel('objC', color=color11)
-    ax11.fill_between(steps, obj_c, facecolor=color11, alpha=0.2, )
-    ax11.tick_params(axis='y', labelcolor=color11)
+    color11 = "darkcyan"
+    ax11.set_ylabel("objC", color=color11)
+    ax11.fill_between(
+        steps,
+        obj_c,
+        facecolor=color11,
+        alpha=0.2,
+    )
+    ax11.tick_params(axis="y", labelcolor=color11)
 
-    color10 = 'royalblue'
-    ax10.set_xlabel('Total Steps')
-    ax10.set_ylabel('objA', color=color10)
-    ax10.plot(steps, obj_a, label='objA', color=color10)
-    ax10.tick_params(axis='y', labelcolor=color10)
+    color10 = "royalblue"
+    ax10.set_xlabel("Total Steps")
+    ax10.set_ylabel("objA", color=color10)
+    ax10.plot(steps, obj_a, label="objA", color=color10)
+    ax10.tick_params(axis="y", labelcolor=color10)
     for plot_i in range(6, recorder.shape[1]):
         other = recorder[:, plot_i]
-        ax10.plot(steps, other, label=f'{plot_i}', color='grey', alpha=0.5)
+        ax10.plot(steps, other, label=f"{plot_i}", color="grey", alpha=0.5)
     ax10.legend()
     ax10.grid()
 
-    '''plot save'''
+    """plot save"""
     plt.title(fig_title, y=2.3)
     plt.savefig(save_path)
-    plt.close('all')  # avoiding warning about too many open figures, rcParam `figure.max_open_warning`
+    plt.close("all")  # avoiding warning about too many open figures, rcParam `figure.max_open_warning`
     # plt.show()  # if use `mpl.use('Agg')` to draw figures without GUI, then plt can't plt.show()
 
 

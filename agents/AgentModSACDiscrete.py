@@ -23,29 +23,21 @@ class AgentModSACDiscrete(AgentBase):
       - reliable_lambda + Two-time Update Rule
     """
 
-    def __init__(
-        self,  state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None
-    ):
+    def __init__(self, state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None):
         super().__init__(state_dim, action_dim, gpu_id, args)
         K = args.env.K
         # ====================================================
         # 1. 初始化 Actor (直接传 args.agent.actor)
         # ====================================================
         self.act = ActorDiscreteSAC(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            K=K,
-            cfg=args.agent.actor  # <--- ★ 核心：把整块配置传进去
+            state_dim=state_dim, action_dim=action_dim, K=K, cfg=args.agent.actor  # <--- ★ 核心：把整块配置传进去
         ).to(self.device)
 
         # ====================================================
         # 2. 初始化 Critic (直接传 args.agent.critic)
         # ====================================================
         self.cri = CriticEnsembleDiscrete(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            K=K,
-            cfg=args.agent.critic # <--- ★ 核心：把整块配置传进去
+            state_dim=state_dim, action_dim=action_dim, K=K, cfg=args.agent.critic  # <--- ★ 核心：把整块配置传进去
         ).to(self.device)
 
         self.act_target = deepcopy(self.act)
@@ -97,8 +89,14 @@ class AgentModSACDiscrete(AgentBase):
             q_label = reward + undone * self.gamma * V_next  # [B]
 
         # ---- critic：Huber over heads ----
-        Q_heads = self.cri.get_q_values(state, action_idx)  # [B,N]
+        Q_heads = self.cri.get_q_values(state, action_idx)  # [B,N], N is num_ensembles
+
         q_labels = q_label.view((-1, 1)).repeat(1, Q_heads.shape[1])
+        if random.random() < 0.05:
+            print("Q_heads: ", Q_heads[:5].detach().cpu().numpy().round(2))
+            print("q_labels: ", q_labels[:5].detach().cpu().numpy().round(2))
+            print("reward: ", reward[:5].detach().cpu().numpy().round(2))
+
         td_error = self.criterion(Q_heads, q_labels).mean(dim=1) * unmask  # [B]
         if self.if_use_per:
             obj_critic = (td_error * is_weight).mean()
@@ -148,15 +146,8 @@ class ActorDiscreteSAC(ActorBase):
       - 否则：MLP 直接输出 logits[K]
     """
 
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        K: int = 1,
-        cfg: Optional[DictConfig] = None
-    ):
+    def __init__(self, state_dim: int, action_dim: int, K: int = 1, cfg: Optional[DictConfig] = None):
         super().__init__(state_dim=state_dim, action_dim=action_dim)
-
 
         # 1. 解析通用参数
         self.K = K
@@ -164,23 +155,23 @@ class ActorDiscreteSAC(ActorBase):
         self.greedy_eps = cfg.greedy_eps
 
         # 2. 决定网络类型
-        self.model_type = cfg.type.lower() # "tcn" or "mlp"
+        self.model_type = cfg.type.lower()  # "tcn" or "mlp"
 
-        if self.model_type == 'tcn':
+        if self.model_type == "tcn":
             tcn_params = OmegaConf.to_container(cfg.tcn_args, resolve=True)
             # 只要特征：return_feature_extractor=True
             self.feat_extractor = build_tcn(
                 state_dim=state_dim,
                 action_dim=action_dim,
-                K = self.K,
+                K=self.K,
                 for_q=False,
                 return_feature_extractor=True,
                 activation=nn.SiLU,
                 **tcn_params,
             )
-            in_dim = tcn_params['emb_ch']
-            self.policy_head = build_mlp([in_dim, *tcn_params['net_dims'], 32, action_dim])
-        elif self.model_type == 'mlp':
+            in_dim = tcn_params["emb_ch"]
+            self.policy_head = build_mlp([in_dim, *tcn_params["net_dims"], 32, action_dim])
+        elif self.model_type == "mlp":
             # 纯 MLP
             net_dim = cfg.mlp_args.net_dims
             self.backbone = build_mlp([state_dim, *net_dim])
@@ -191,10 +182,10 @@ class ActorDiscreteSAC(ActorBase):
         layer_init_with_orthogonal(self.policy_head[-1], std=1)
 
     def _logits(self, state: TEN) -> TEN:
-        if self.model_type == 'tcn':
+        if self.model_type == "tcn":
             feat = self.feat_extractor(state)  # [B, C]
             logits = self.policy_head(feat)  # [B, K]
-        elif self.model_type == 'mlp':
+        elif self.model_type == "mlp":
             h = self.backbone(state)
             logits = self.policy_head(h)
         return logits
@@ -220,8 +211,15 @@ class ActorDiscreteSAC(ActorBase):
         dist = th.distributions.Categorical(probs=probs)
         action_idx = dist.sample()  # [B]
 
-        if random.random() < 0.000004:
-            print("logits:", self._logits(state).detach().cpu().numpy(), " probs:", probs.detach().cpu().numpy(), " action_idx:", action_idx.item())
+        if random.random() < 0.000001:
+            print(
+                "logits:",
+                self._logits(state).detach().cpu().numpy(),
+                " probs:",
+                probs.detach().cpu().numpy(),
+                " action_idx:",
+                action_idx.item(),
+            )  # p
         return action_idx
 
     def get_action_logprob(self, state: TEN) -> Tuple[TEN, TEN]:
@@ -243,13 +241,7 @@ class CriticEnsembleDiscrete(nn.Module):
       - TCN：共享 TCN 特征抽取器 -> per-head decoder -> K 维
     """
 
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        K: int = 1,
-        cfg: Optional[DictConfig] = None
-    ):
+    def __init__(self, state_dim: int, action_dim: int, K: int = 1, cfg: Optional[DictConfig] = None):
         super().__init__()
         self.K = K
         self.action_dim = action_dim  # K_actions（离散动作数）
@@ -258,7 +250,7 @@ class CriticEnsembleDiscrete(nn.Module):
         # 2. 决定网络类型
         self.model_type = cfg.type.lower()
 
-        if self.model_type == 'mlp':
+        if self.model_type == "mlp":
             # MLP 共享编码（注意：如果你的状态是 K 个时间片拼接，这里只取最后一个片段）
             net_dims = cfg.mlp_args.net_dims
             self.state_single_len = state_dim // K
@@ -269,7 +261,7 @@ class CriticEnsembleDiscrete(nn.Module):
                 dec = build_mlp([*net_dims, 32, action_dim])  # 末层输出 K_actions
                 layer_init_with_orthogonal(dec[-1], std=1)
                 self.decoders.append(dec)
-        if self.model_type == 'tcn':
+        if self.model_type == "tcn":
             # 共享 TCN 特征抽取
             tcn_params = OmegaConf.to_container(cfg.tcn_args, resolve=True)
             self.feat_extractor = build_tcn(
@@ -281,8 +273,8 @@ class CriticEnsembleDiscrete(nn.Module):
                 for_q=False,
                 return_feature_extractor=True,
             )
-            in_dim = tcn_params['emb_ch']
-            net_dims = tcn_params['net_dims']
+            in_dim = tcn_params["emb_ch"]
+            net_dims = tcn_params["net_dims"]
             self.decoders = nn.ModuleList()
             for _ in range(self.num_ensembles):
                 dec = build_mlp([in_dim, *net_dims, 32, action_dim])
@@ -290,12 +282,12 @@ class CriticEnsembleDiscrete(nn.Module):
                 self.decoders.append(dec)
 
     def _features(self, state: TEN) -> TEN:
-        if self.model_type == 'mlp':
+        if self.model_type == "mlp":
             # 若 state 拼了 K 段，就只取最后一段
             s_true = state[..., -self.state_single_len :]
             feat = self.encoder_s(s_true)
             return feat
-        elif self.model_type == 'tcn':
+        elif self.model_type == "tcn":
             return self.feat_extractor(state)
 
     def get_q_all(self, state: TEN) -> TEN:

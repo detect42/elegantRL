@@ -22,17 +22,25 @@ def process_config(cfg: DictConfig) -> DictConfig:
     1. 不拍平 (No Flattening)：保持 cfg.train.lr 这种层级。
     2. 不填默认值 (No Defaults)：Yaml 里没写的就报错。
     """
-
     # [Step 1] 解锁：允许写入新属性 (如 agent_class, state_dim)
     OmegaConf.set_struct(cfg, False)
 
     # [Step 2] 逻辑 A: 环境参数衍生计算
     # 比如 state_dim = 15 * K
-    if cfg.env.get('K') is not None:
+    if cfg.env.get("K") is not None:
         cfg.env.state_dim = cfg.env.state_dim * cfg.env.K
         print(f"| Config: Derived state_dim={cfg.env.state_dim}")
+
+    cfg.train.batch_size = cfg.train.batch_size * cfg.train.kk
+    cfg.train.horizon_len = cfg.train.horizon_len * cfg.train.kk
+    cfg.train.buffer_size = cfg.train.buffer_size * cfg.train.kk
+    print(
+        f"| Config: Scaled batch_size={cfg.train.batch_size}, horizon_len={cfg.train.horizon_len}, buffer_size={cfg.train.buffer_size}"
+    )
+
     cfg.env.gpu_id = cfg.sys.gpu_id
     cfg.eval.env.gpu_id = cfg.sys.gpu_id
+    cfg.eval.env.K = cfg.env.K
     # [Step 3] 逻辑 B: 自动推断 Off-policy
     agent_name = cfg.agent.agent_name
     on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
@@ -45,6 +53,7 @@ def process_config(cfg: DictConfig) -> DictConfig:
 
     return cfg
 
+
 # ================================================================
 # 2. 副作用执行：初始化环境 (单独保留)
 # ================================================================
@@ -55,7 +64,7 @@ def init_before_training(cfg: DictConfig):
     # 1. 随机种子
     seed = cfg.sys.random_seed
     if seed is None:
-        seed = max(0, cfg.sys.gpu_id) # 默认用 GPU ID
+        seed = max(0, cfg.sys.gpu_id)  # 默认用 GPU ID
 
         # 因为我们之前关锁了，这里临时解锁修改一下 seed
         OmegaConf.set_struct(cfg, False)
@@ -81,19 +90,21 @@ def init_before_training(cfg: DictConfig):
     print(f"| Init: Seed={seed}, Threads={cfg.sys.num_threads}")
     print(f"| Init: CWD={cfg.eval.cwd}")
 
+
 # ================================================================
 # 辅助工具
 # ================================================================
 def get_class_from_path(path: str):
     """根据字符串路径加载类"""
     try:
-        if '.' in path:
-            module_path, class_name = path.rsplit('.', 1)
+        if "." in path:
+            module_path, class_name = path.rsplit(".", 1)
             module = importlib.import_module(module_path)
             return getattr(module, class_name)
         else:
             # 默认尝试从 elegantrl.agents 找
             import elegantrl.agents
+
             return getattr(elegantrl.agents, path)
     except (ImportError, AttributeError) as e:
         raise ImportError(f"Cannot import class: {path}. {e}")
@@ -103,19 +114,19 @@ def build_env(env_class=None, cfg: Optional[DictConfig] = None, gpu_id: int = -1
     import warnings
 
     warnings.filterwarnings("ignore", message=".*get variables from other wrappers is deprecated.*")
-    #env_args["gpu_id"] = gpu_id  # set gpu_id for vectorized env before build it
+    # env_args["gpu_id"] = gpu_id  # set gpu_id for vectorized env before build it
 
     if cfg.if_build_vec_env:
-        env = VecEnv(env_class=env_class, cfg = cfg, gpu_id=gpu_id)
+        env = VecEnv(env_class=env_class, cfg=cfg, gpu_id=gpu_id)
     elif env_class.__module__ == "gymnasium.envs.registration":
         env = env_class(id=cfg.env_name)
     else:
         env = env_class(cfg)
 
-
     for attr_str in ("env_name", "num_envs", "max_step", "state_dim", "action_dim", "if_discrete"):
         assert hasattr(env, attr_str), f"Environment missing required attribute: {attr_str}"
     return env
+
 
 def kwargs_filter(function, kwargs: dict) -> dict:
     import inspect
@@ -193,6 +204,7 @@ def get_gym_env_args(env, if_print: bool) -> dict:
     cfg = DictConfig(env_args)
     return cfg
 
+
 """vectorized env"""
 
 
@@ -237,7 +249,7 @@ class VecEnv:
     def __init__(self, env_class: object, cfg: DictConfig, gpu_id: int = -1):
         self.device = th.device(f"cuda:{gpu_id}" if (th.cuda.is_available() and (gpu_id >= 0)) else "cpu")
         self.num_envs = cfg.num_envs  # the number of sub env in vectorized env.
-
+        assert self.num_envs > 1
         """the necessary env information when you design a custom env"""
         self.env_name = cfg.env_name  # the name of this env.
         self.max_step = cfg.max_step  # the max step number in an episode for evaluation
@@ -261,6 +273,7 @@ class VecEnv:
 
         [setattr(p, "daemon", True) for p in self.sub_envs]  # set before process start to exit safely
         [p.start() for p in self.sub_envs]
+
     def reset(self) -> Tuple[TEN, dict]:  # reset the agent in env
         th.set_grad_enabled(False)
 

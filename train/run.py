@@ -13,6 +13,7 @@ from .evaluator import Evaluator
 from .evaluator import get_rewards_and_steps
 from omegaconf import DictConfig, OmegaConf
 from .config import get_class_from_path  # 引入那个智能加载函数
+
 if os.name == "nt":  # if is WindowOS (Windows NT)
     """Fix bug about Anaconda in WindowOS
     OMP: Error #15: Initializing libIOmp5md.dll, but found libIOmp5md.dll already initialized.
@@ -37,9 +38,8 @@ def train_agent(args: DictConfig, if_single_process: bool = False):
 
 
 def train_agent_single_process(args: DictConfig):
-    #args.init_before_training()
+    # args.init_before_training()
     th.set_grad_enabled(False)
-
 
     """init environment"""
     env_class = get_class_from_path(args.env.class_name)
@@ -122,7 +122,7 @@ def train_agent_single_process(args: DictConfig):
             show_str = action_to_str(_action_ary=buffer_items[1].data.cpu())
         else:  # TODO PLAN add action_dist
             show_str = ""
-        exp_r = buffer_items[2].mean().item() #! on-policy的时候变成了对logprob的mean 需要if
+        exp_r = buffer_items[2].mean().item()  #! on-policy的时候变成了对logprob的mean 需要if
 
         th.set_grad_enabled(True)
         logging_tuple = agent.update_net(buffer)
@@ -143,7 +143,7 @@ def train_agent_single_process(args: DictConfig):
 
 
 def train_agent_multiprocessing(args: DictConfig):
-    #args.init_before_training()
+    # args.init_before_training()
 
     """Don't set method='fork' when send tensor in GPU"""
     method = "spawn" if os.name == "nt" else "forkserver"  # os.name == 'nt' means Windows NT operating system (WinOS)
@@ -169,7 +169,7 @@ def train_agent_multiprocessing(args: DictConfig):
 
 
 def train_agent_multiprocessing_multi_gpu(args: DictConfig):
-    #args.init_before_training()
+    # args.init_before_training()
 
     """Don't set method='fork' when send tensor in GPU"""
     method = "spawn" if os.name == "nt" else "forkserver"  # os.name == 'nt' means Windows NT operating system (WinOS)
@@ -298,6 +298,7 @@ class Learner(Process):
             logprobs = th.zeros((horizon_len, num_seqs), dtype=th.float32, device=agent.device)
             buffer_items_tensor = (states, actions, logprobs, rewards, undones, unmasks)
 
+        accumulated_steps = 0
         if_train = True
         while if_train:
             actor = agent.act
@@ -320,7 +321,7 @@ class Learner(Process):
             """COMMUNICATE between Learners: Learner send actor to other Learners"""
             _buffer_len = num_envs * num_workers
             _buffer_items_tensor = [t[:, :_buffer_len].cpu().detach() for t in buffer_items_tensor]
-            for shift_id in range(num_communications): #! 这里shift_id在循环内部没用？
+            for shift_id in range(num_communications):  #! 这里shift_id在循环内部没用？
                 _learner_pipe = self.learners_pipe[learner_id][0]
                 _learner_pipe.send(_buffer_items_tensor)
             """COMMUNICATE between Learners: Learner receive (buffer_items, last_state) from other Learners"""
@@ -345,23 +346,22 @@ class Learner(Process):
             logging_tuple = agent.update_net(buffer)
             th.set_grad_enabled(False)
 
+            if if_off_policy:
+                exp_r = (
+                    buffer_items_tensor[2].mean().item()
+                )  #! 这里很暴力的直接取mean，是不是应该对每一列（一个轨迹求和）再做mean？但也可能我们假设了所有轨迹都一样长
+            else:
+                exp_r = buffer_items_tensor[3].mean().item()
+
+            accumulated_steps += num_steps
             """Learner receive training signal from Evaluator"""
             if self.eval_pipe.poll():  # whether there is any data available to be read of this pipe0
                 if_train = self.eval_pipe.recv()  # True means evaluator in idle moments.
-                # actor = agent.act
-                # actor = deepcopy(actor).cpu() if os.name == 'nt' else actor  # WindowsNT_OS can only send cpu_tensor
+                self.eval_pipe.send((actor, accumulated_steps, exp_r, logging_tuple))
+                accumulated_steps = 0
             else:
-                actor = None
-
-            """Learner send actor and training log to Evaluator"""
-            if if_train:
-                if if_off_policy:
-                    exp_r = (
-                        buffer_items_tensor[2].mean().item()
-                    )  #! 这里很暴力的直接取mean，是不是应该对每一列（一个轨迹求和）再做mean？但也可能我们假设了所有轨迹都一样长
-                else:
-                    exp_r = buffer_items_tensor[3].mean().item()
-                self.eval_pipe.send((actor, num_steps, exp_r, logging_tuple))
+                # print("| Learner: Evaluator Pipe No Data Poll()", flush=True)  #
+                pass
 
         """Learner send the terminal signal to workers after break the loop"""
         print("| Learner Close Worker", flush=True)
@@ -393,7 +393,7 @@ class Worker(Process):
 
         """init environment"""
         env_class = get_class_from_path(args.env.class_name)
-        #print(env_class)
+        # print(env_class)
         env = build_env(env_class, args.env, args.sys.gpu_id)
 
         """init agent"""
@@ -421,21 +421,26 @@ class Worker(Process):
 
         """loop"""
         del args
-
-        while True:
-            """Worker receive actor from Learner"""
-            actor = self.recv_pipe.recv()
-            if actor is None:
-                break
-            agent.act = actor.to(agent.device) if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
-
-            """Worker send the training data to Learner"""
-            buffer_items = agent.explore_env(env, horizon_len)
-            last_state = agent.last_state
-            if os.name == "nt":  # WindowsNT_OS can only send cpu_tensor
-                buffer_items = [t.cpu() for t in buffer_items]
-                last_state = deepcopy(last_state).cpu()
-            self.send_pipe.send((worker_id, buffer_items, last_state))
+        #import time  #!
+        th.set_num_threads(1)
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1, user_api='blas'):
+            while True:
+                """Worker receive actor from Learner"""
+                actor = self.recv_pipe.recv()
+                if actor is None:
+                    break
+                agent.act = actor.to(agent.device) if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
+                #t0 = time.time()  #!
+                """Worker send the training data to Learner"""
+                buffer_items = agent.explore_env(env, horizon_len)
+                last_state = agent.last_state
+                if os.name == "nt":  # WindowsNT_OS can only send cpu_tensor
+                    buffer_items = [t.cpu() for t in buffer_items]
+                    last_state = deepcopy(last_state).cpu()
+                self.send_pipe.send((worker_id, buffer_items, last_state))
+                #t1 = time.time()  #!
+                #print(f"| Worker-{worker_id} Explore Time: {t1 - t0:.3f}s", flush=True)  #!
 
         env.close() if hasattr(env, "close") else None
         print(f"| Worker-{self.worker_id} Closed", flush=True)
@@ -466,10 +471,11 @@ class EvaluatorProc(Process):
         del args
 
         if_train = True
+        self.pipe0.send(if_train)
         while if_train:
+            # print("| Evaluator: Waiting for Learner", flush=True)
             """Evaluator receive training log from Learner"""
             actor, steps, exp_r, logging_tuple = self.pipe0.recv()
-
             """Evaluator evaluate the actor and save the training log"""
             if actor is None:
                 evaluator.total_step += steps  # update total_step but don't update recorder
@@ -502,7 +508,9 @@ class EvaluatorProc(Process):
 """render"""
 
 
-def valid_agent(env_class, env_cfg: DictConfig, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8):
+def valid_agent(
+    env_class, env_cfg: DictConfig, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8
+):
     env = build_env(env_class, env_cfg)
 
     state_dim = env_cfg.state_dim
@@ -517,7 +525,9 @@ def valid_agent(env_class, env_cfg: DictConfig, net_dims: List[int], agent_class
         print(f"|{i:4}  cumulative_reward {cumulative_reward:9.3f}  episode_step {episode_step:5.0f}", flush=True)
 
 
-def render_agent(env_class, env_cfg: DictConfig, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8):
+def render_agent(
+    env_class, env_cfg: DictConfig, net_dims: List[int], agent_class, actor_path: str, render_times: int = 8
+):
     env = build_env(env_class, env_cfg)
 
     state_dim = env_cfg.state_dim

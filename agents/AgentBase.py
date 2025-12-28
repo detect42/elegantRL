@@ -93,10 +93,15 @@ class AgentBase:
         rewards = th.zeros(horizon_len, dtype=th.float32).to(self.device)
         terminals = th.zeros(horizon_len, dtype=th.bool).to(self.device)
         truncates = th.zeros(horizon_len, dtype=th.bool).to(self.device)
-
+        #import time#!
+        #t0 = time.time()#!
+        #model_time = 0#!
         state = self.last_state
         for t in range(horizon_len):
+            #t_start = time.time()#!
             action = self.explore_action(state)[0]
+
+
             # if_discrete == False  action.shape (1, action_dim) -> (action_dim, )
             # if_discrete == True   action.shape (1, ) -> ()
 
@@ -104,6 +109,8 @@ class AgentBase:
             actions[t] = action
 
             ary_action = action.detach().cpu().numpy()
+            #t_end = time.time()#!
+            #model_time += t_end - t_start #!
             ary_state, reward, terminal, truncate, _ = env.step(ary_action)
             if terminal or truncate:
                 ary_state, info_dict = env.reset()
@@ -112,6 +119,8 @@ class AgentBase:
             rewards[t] = reward
             terminals[t] = terminal
             truncates[t] = truncate
+        #t1 = time.time()#!
+        #print(f"| Explore Total Time: {t1 - t0:.3f}s, Model Time: {model_time:.3f}s", flush=True)#!
 
         self.last_state = state  # state.shape == (1, state_dim) for a single env.
         '''add dim1=1 below for workers buffer_items concat'''
