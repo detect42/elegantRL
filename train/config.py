@@ -42,11 +42,12 @@ def process_config(cfg: DictConfig) -> DictConfig:
     cfg.eval.env.gpu_id = cfg.sys.gpu_id
     cfg.eval.env.K = cfg.env.K
     # [Step 3] 逻辑 B: 自动推断 Off-policy
-    agent_name = cfg.agent.agent_name
-    on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
-    # 如果名字里找不到 On-Policy 的关键词，那就是 Off-Policy
-    is_off_policy = all(name not in agent_name for name in on_policy_names)
-    cfg.agent.if_off_policy = is_off_policy
+    if not hasattr(cfg.agent, "if_off_policy") or (cfg.agent.if_off_policy is None):
+        agent_name = cfg.agent.agent_name
+        on_policy_names = ("SARSA", "VPG", "A2C", "A3C", "TRPO", "PPO", "MPO")
+        # 如果名字里找不到 On-Policy 的关键词，那就是 Off-Policy
+        is_off_policy = all(name not in agent_name for name in on_policy_names)
+        cfg.agent.if_off_policy = is_off_policy
 
     # [Step 4] 关锁：处理完毕，禁止后续代码随意添加新 Key，防止拼写错误
     OmegaConf.set_struct(cfg, True)

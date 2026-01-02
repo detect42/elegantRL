@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import numpy as np
 import torch as th
@@ -7,10 +8,12 @@ from typing import Union, Optional
 import random
 import torch.nn.functional as F
 from ..train import ReplayBuffer
+from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
+from abc import ABC, abstractmethod
 TEN = th.Tensor
 
-'''agent'''
+"""agent"""
 
 
 class AgentBase:
@@ -23,9 +26,13 @@ class AgentBase:
     args: the arguments for agent training. `args = Config()`
     """
 
-    def __init__(self, state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None):
+    act: ActorBase
+    act_target: ActorBase
+    cri: CriticBase
+    cri_target: CriticBase
+
+    def __init__(self, state_dim: int, action_dim: int, gpu_id: int, args: DictConfig):
         self.if_discrete: bool = args.env.if_discrete
-        self.if_off_policy: bool = args.agent.if_off_policy
 
         self.state_dim = state_dim  # feature number of state
         self.action_dim = action_dim  # feature number of continuous action or number of discrete action
@@ -36,44 +43,37 @@ class AgentBase:
         self.batch_size = args.train.batch_size  # num of transitions sampled from replay buffer.
         self.repeat_times = args.train.repeat_times  # repeatedly update network using ReplayBuffer
         self.reward_scale = args.train.reward_scale  # an approximate target reward usually be closed to 256
-        self.learning_rate = args.train.learning_rate  # the learning rate for network updating
         self.if_off_policy = args.agent.if_off_policy  # whether off-policy or on-policy of DRL algorithm
         self.clip_grad_norm = args.train.clip_grad_norm  # clip the gradient after normalization
         self.soft_update_tau = args.train.soft_update_tau  # the tau of soft target update `net = (1-tau)*net + net1`
         self.state_value_tau = args.train.state_value_tau  # the tau of normalize for value and state
         self.buffer_init_size = args.train.buffer_init_size  # train after samples over buffer_init_size for off-policy
 
-        self.last_state: Optional[TEN] = None  # last state of the trajectory. shape == (num_envs, state_dim)
+        self.last_state: TEN  # last state of the trajectory. shape == (num_envs, state_dim)
         self.device = th.device(f"cuda:{gpu_id}" if (th.cuda.is_available() and (gpu_id >= 0)) else "cpu")
 
-        '''network'''
-        self.act = None
-        self.cri = None
-        self.act_target = self.act
-        self.cri_target = self.cri
+        """optimizer"""
+        self.act_optimizer: th.optim.Optimizer
+        self.cri_optimizer: th.optim.Optimizer
 
-        '''optimizer'''
-        self.act_optimizer: Optional[th.optim] = None
-        self.cri_optimizer: Optional[th.optim] = None
-
-        self.criterion = getattr(args, 'criterion', th.nn.MSELoss(reduction="none"))
+        self.criterion = instantiate(args.agent.criterion)
         self.if_vec_env = self.num_envs > 1  # use vectorized environment (vectorized simulator)
-        self.if_use_per = getattr(args, 'if_use_per', None)  # use PER (Prioritized Experience Replay)
-        self.lambda_fit_cum_r = getattr(args, 'lambda_fit_cum_r', 0.0)  # critic fits cumulative returns
+        self.if_use_per = args.train.if_use_per  # use PER (Prioritized Experience Replay)
+        self.lambda_fit_cum_r = args.train.lambda_fit_cum_r  # critic fits cumulative returns
 
         """save and load"""
-        self.save_attr_names = {'act', 'act_target', 'act_optimizer', 'cri', 'cri_target', 'cri_optimizer'}
+        self.save_attr_names = {"act", "act_target", "act_optimizer", "cri", "cri_target", "cri_optimizer"}
 
-    def explore_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN]:
+    def explore_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
         if self.if_vec_env:
             return self._explore_vec_env(env=env, horizon_len=horizon_len)
         else:
             return self._explore_one_env(env=env, horizon_len=horizon_len)
 
-    def explore_action(self, state: TEN) -> TEN:
-        return self.act.get_action(state)
+    def explore_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]: #! action or (action,logprob)
+        return self.act.get_action(state)  #! agentbase里没有定义get_action方法
 
-    def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN]:
+    def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **single** environment instance.
 
@@ -86,21 +86,25 @@ class AgentBase:
             `rewards.shape == (horizon_len, num_envs)`
             `undones.shape == (horizon_len, num_envs)`
             `unmasks.shape == (horizon_len, num_envs)`
+
+        #! for on-policy algorithm like PPO, add logprob as the 3rd return value
         """
         states = th.zeros((horizon_len, self.state_dim), dtype=th.float32).to(self.device)
-        actions = th.zeros((horizon_len, self.action_dim), dtype=th.float32).to(self.device) \
-            if not self.if_discrete else th.zeros(horizon_len, dtype=th.int32).to(self.device)
+        actions = (
+            th.zeros((horizon_len, self.action_dim), dtype=th.float32).to(self.device)
+            if not self.if_discrete
+            else th.zeros(horizon_len, dtype=th.int32).to(self.device)
+        )
         rewards = th.zeros(horizon_len, dtype=th.float32).to(self.device)
         terminals = th.zeros(horizon_len, dtype=th.bool).to(self.device)
         truncates = th.zeros(horizon_len, dtype=th.bool).to(self.device)
-        #import time#!
-        #t0 = time.time()#!
-        #model_time = 0#!
+        # import time#!
+        # t0 = time.time()#!
+        # model_time = 0#!
         state = self.last_state
         for t in range(horizon_len):
-            #t_start = time.time()#!
+            # t_start = time.time()#!
             action = self.explore_action(state)[0]
-
 
             # if_discrete == False  action.shape (1, action_dim) -> (action_dim, )
             # if_discrete == True   action.shape (1, ) -> ()
@@ -109,8 +113,8 @@ class AgentBase:
             actions[t] = action
 
             ary_action = action.detach().cpu().numpy()
-            #t_end = time.time()#!
-            #model_time += t_end - t_start #!
+            # t_end = time.time()#!
+            # model_time += t_end - t_start #!
             ary_state, reward, terminal, truncate, _ = env.step(ary_action)
             if terminal or truncate:
                 ary_state, info_dict = env.reset()
@@ -119,21 +123,22 @@ class AgentBase:
             rewards[t] = reward
             terminals[t] = terminal
             truncates[t] = truncate
-        #t1 = time.time()#!
-        #print(f"| Explore Total Time: {t1 - t0:.3f}s, Model Time: {model_time:.3f}s", flush=True)#!
+        # t1 = time.time()#!
+        # print(f"| Explore Total Time: {t1 - t0:.3f}s, Model Time: {model_time:.3f}s", flush=True)#!
 
         self.last_state = state  # state.shape == (1, state_dim) for a single env.
-        '''add dim1=1 below for workers buffer_items concat'''
+        """add dim1=1 below for workers buffer_items concat"""
         states = states.view((horizon_len, 1, self.state_dim))
         actions = actions.view((horizon_len, 1, self.action_dim if not self.if_discrete else 1))
-        actions = actions.view((horizon_len, 1, self.action_dim)) \
-            if not self.if_discrete else actions.view((horizon_len, 1))
+        actions = (
+            actions.view((horizon_len, 1, self.action_dim)) if not self.if_discrete else actions.view((horizon_len, 1))
+        )
         rewards = (rewards * self.reward_scale).view((horizon_len, 1))
         undones = th.logical_not(terminals).view((horizon_len, 1))
         unmasks = th.logical_not(truncates).view((horizon_len, 1))
         return states, actions, rewards, undones, unmasks
 
-    def _explore_vec_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN]:
+    def _explore_vec_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **vectorized** environment instance.
 
@@ -148,8 +153,11 @@ class AgentBase:
             `unmasks.shape == (horizon_len, num_envs)`
         """
         states = th.zeros((horizon_len, self.num_envs, self.state_dim), dtype=th.float32).to(self.device)
-        actions = th.zeros((horizon_len, self.num_envs, self.action_dim), dtype=th.float32).to(self.device) \
-            if not self.if_discrete else th.zeros((horizon_len, self.num_envs), dtype=th.int32).to(self.device)
+        actions = (
+            th.zeros((horizon_len, self.num_envs, self.action_dim), dtype=th.float32).to(self.device)
+            if not self.if_discrete
+            else th.zeros((horizon_len, self.num_envs), dtype=th.int32).to(self.device)
+        )
         rewards = th.zeros((horizon_len, self.num_envs), dtype=th.float32).to(self.device)
         terminals = th.zeros((horizon_len, self.num_envs), dtype=th.bool).to(self.device)
         truncates = th.zeros((horizon_len, self.num_envs), dtype=th.bool).to(self.device)
@@ -175,7 +183,7 @@ class AgentBase:
         unmasks = th.logical_not(truncates)
         return states, actions, rewards, undones, unmasks
 
-    def update_net(self, buffer: Union[ReplayBuffer, tuple]) -> tuple[float, ...]:
+    def update_net(self, buffer: ReplayBuffer) -> tuple[float, ...]:  #! on-policy算法比如ppo 这里的buffer就是tuple，不是class，所以需要在对应子类agent redefine这个function
         objs_critic = []
         objs_actor = []
 
@@ -190,16 +198,17 @@ class AgentBase:
             objs_actor.append(obj_actor) if isinstance(obj_actor, float) else None
         th.set_grad_enabled(False)
 
-        obj_avg_critic = np.nanmean(objs_critic) if len(objs_critic) else 0.0
-        obj_avg_actor = np.nanmean(objs_actor) if len(objs_actor) else 0.0
+        obj_avg_critic = np.array(objs_critic).mean() if len(objs_critic) else 0.0
+        obj_avg_actor = np.array(objs_actor).mean() if len(objs_actor) else 0.0
         return obj_avg_critic, obj_avg_actor
 
-    def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> tuple[float, float]:
+    def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> tuple[float, ...]:
         assert isinstance(update_t, int)
         with th.no_grad():
             if self.if_use_per:
-                (state, action, reward, undone, unmask, next_state,
-                 is_weight, is_index) = buffer.sample_for_per(self.batch_size)
+                (state, action, reward, undone, unmask, next_state, is_weight, is_index) = buffer.sample_for_per(
+                    self.batch_size
+                )
             else:
                 state, action, reward, undone, unmask, next_state = buffer.sample(self.batch_size)
                 is_weight, is_index = None, None
@@ -213,6 +222,7 @@ class AgentBase:
         td_error = self.criterion(q_value, q_label) * unmask
         if self.if_use_per:
             obj_critic = (td_error * is_weight).mean()
+            assert is_index is not None
             buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
         else:
             obj_critic = td_error.mean()
@@ -242,7 +252,7 @@ class AgentBase:
             cum_rewards[t] = next_value = rewards[t] + masks[t] * next_value
         return cum_rewards
 
-    def optimizer_backward(self, optimizer: th.optim, objective: TEN):
+    def optimizer_backward(self, optimizer: th.optim.Optimizer, objective: TEN):
         """minimize the optimization objective via update the network parameters
 
         optimizer: `optimizer = th.optim.SGD(net.parameters(), learning_rate)`
@@ -253,7 +263,7 @@ class AgentBase:
         clip_grad_norm_(parameters=optimizer.param_groups[0]["params"], max_norm=self.clip_grad_norm)
         optimizer.step()
 
-    def optimizer_backward_amp(self, optimizer: th.optim, objective: TEN):  # automatic mixed precision
+    def optimizer_backward_amp(self, optimizer: th.optim.Optimizer, objective: TEN):  # automatic mixed precision
         """minimize the optimization objective via update the network parameters
 
         amp: Automatic Mixed Precision
@@ -289,7 +299,7 @@ class AgentBase:
         cwd: Current Working Directory. ElegantRL save training files in CWD.
         if_save: True: save files. False: load files.
         """
-        assert self.save_attr_names.issuperset({'act', 'act_optimizer'})
+        assert self.save_attr_names.issuperset({"act", "act_optimizer"})
 
         for attr_name in self.save_attr_names:
             file_path = f"{cwd}/{attr_name}.pth"
@@ -303,45 +313,50 @@ class AgentBase:
                 setattr(self, attr_name, th.load(file_path, map_location=self.device))
 
 
-def get_optim_param(optimizer: th.optim) -> list:  # backup
+def get_optim_param(optimizer: th.optim.Optimizer) -> list:  # backup
     params_list = []
     for params_dict in optimizer.state_dict()["state"].values():
         params_list.extend([t for t in params_dict.values() if isinstance(t, th.Tensor)])
     return params_list
 
 
-'''network'''
+"""network"""
 
 
-class ActorBase(nn.Module):
+class ActorBase(nn.Module, ABC):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
-        self.net = None  # build_mlp(net_dims=[state_dim, *net_dims, action_dim])
+        self.net: nn.Module  # build_mlp(net_dims=[state_dim, *net_dims, action_dim])
 
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.ActionDist = th.distributions.normal.Normal
+
+    @abstractmethod
+    def get_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]:
+        pass
 
     def forward(self, state: TEN) -> TEN:
         action = self.net(state)
         return action.tanh()
 
 
-class CriticBase(nn.Module):
+class CriticBase(nn.Module, ABC):
     def __init__(self, state_dim: int, action_dim: int):
         super().__init__()
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.net = None  # build_mlp(net_dims=[state_dim + action_dim, *net_dims, 1])
+        self.net: nn.Module  # build_mlp(net_dims=[state_dim + action_dim, *net_dims, 1])
 
-    def forward(self, state: TEN, action: TEN) -> TEN:
+
+    """def forward(self, state: TEN, action: TEN) -> TEN:
         values = self.get_q_values(state=state, action=action)
         value = values.mean(dim=-1, keepdim=True)
         return value  # Q value
 
     def get_q_values(self, state: TEN, action: TEN) -> TEN:
         values = self.net(th.cat((state, action), dim=1))
-        return values  # Q values
+        return values  # Q values"""
 
 
 """utils"""
@@ -353,6 +368,7 @@ import torch as th
 from torch import nn
 import torch.nn.functional as F
 
+
 class _CausalConv1d_BKC(nn.Module):
     """
     因果一维卷积（封装内部转置）：
@@ -360,40 +376,43 @@ class _CausalConv1d_BKC(nn.Module):
     - 内部仅在卷积时转换为 (B, C, K)
     - 因果左补，时间长度保持不变
     """
+
     def __init__(self, in_ch: int, out_ch: int, kernel_size: int = 3, dilation: int = 1, bias: bool = True):
         super().__init__()
         assert kernel_size % 2 == 1, "kernel_size 建议用奇数（如3）"
         self.pad_left = dilation * (kernel_size - 1)
         self.pad = nn.ConstantPad1d((self.pad_left, 0), 0.0)  # 作用在 (B,C,K) 上
-        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size,
-                              dilation=dilation, padding=0, bias=bias)
+        self.conv = nn.Conv1d(in_ch, out_ch, kernel_size=kernel_size, dilation=dilation, padding=0, bias=bias)
 
     def forward(self, x_bkc: th.Tensor) -> th.Tensor:
         # x_bkc: (B, K, C) -> (B, C, K)
         x_bck = x_bkc.transpose(1, 2).contiguous()
-        y_bck = self.conv(self.pad(x_bck))          # (B, out_ch, K)
+        y_bck = self.conv(self.pad(x_bck))  # (B, out_ch, K)
         y_bkc = y_bck.transpose(1, 2).contiguous()  # (B, K, out_ch)
         return y_bkc
+
 
 class RMSNorm(nn.Module):
     def __init__(self, ch, eps=1e-6):
         super().__init__()
         self.g = nn.Parameter(th.ones(ch))
         self.eps = eps
+
     def forward(self, x):  # x: (B,K,C)
         rms = th.sqrt(th.mean(x * x, dim=-1, keepdim=True) + self.eps)
         return x / rms * self.g
 
+
 class _TCNBlock_BKC(nn.Module):
-    def __init__(self, ch, kernel_size=3, dilation=1, dropout=0.00, norm='none', use_residual=True, init_scale=0.1):
+    def __init__(self, ch, kernel_size=3, dilation=1, dropout=0.00, norm="none", use_residual=True, init_scale=0.1):
         super().__init__()
         self.norm = norm
         self.use_residual = use_residual
 
-        if norm == 'ln':
+        if norm == "ln":
             self.n1 = nn.LayerNorm(ch)
             self.n2 = nn.LayerNorm(ch)
-        elif norm == 'rms':
+        elif norm == "rms":
             self.n1 = RMSNorm(ch)
             self.n2 = RMSNorm(ch)
 
@@ -412,20 +431,20 @@ class _TCNBlock_BKC(nn.Module):
         self.res_scale = nn.Parameter(th.tensor(float(init_scale))) if use_residual else None
 
     def _norm(self, x, which):
-        if self.norm == 'ln':
+        if self.norm == "ln":
             return self.n1(x) if which == 1 else self.n2(x)
-        if self.norm == 'rms':
+        if self.norm == "rms":
             return self.n1(x) if which == 1 else self.n2(x)
         return x  # 'none'
 
     def forward(self, x):
         y = self._norm(x, which=1)
         y = F.silu(self.conv1(y))
-        #y = self.drop1(y)
+        # y = self.drop1(y)
 
         y = self._norm(y, which=2)
         y = self.conv2(F.silu(y))
-        #y = self.drop2(y)
+        # y = self.drop2(y)
 
         if self.use_residual:
             return x + self.res_scale * y
@@ -441,15 +460,20 @@ class _TemporalEncoderFlat(nn.Module):
          若带 action，则返回 cat([z, action]) -> (B, C+action_dim)
     注：全程保持 channels-last (B, K, C)，无显式外部转置
     """
-    def __init__(self, state_dim: int, K: int,
-                 emb_ch: int = 32,
-                 num_blocks: int = 2,
-                 kernel_size: int = 3,
-                 dilations=None,
-                 dropout: float = 0.00):
+
+    def __init__(
+        self,
+        state_dim: int,
+        K: int,
+        emb_ch: int = 32,
+        num_blocks: int = 2,
+        kernel_size: int = 3,
+        dilations=None,
+        dropout: float = 0.00,
+    ):
         super().__init__()
-        self.state_dim = (state_dim)//K  # S
-        assert(self.state_dim * K == state_dim), "state_dim 必须能被 K 整除"
+        self.state_dim = (state_dim) // K  # S
+        assert self.state_dim * K == state_dim, "state_dim 必须能被 K 整除"
         self.K = int(K)
         self.emb_ch = emb_ch
 
@@ -462,10 +486,20 @@ class _TemporalEncoderFlat(nn.Module):
         self.step_fc2 = nn.Linear(emb_ch, emb_ch)
 
         # TCN 段（channels-last 版本）
-        self.blocks = nn.ModuleList([
-            _TCNBlock_BKC(emb_ch, kernel_size=kernel_size, dilation=d, dropout=dropout,norm="ln",use_residual=True, init_scale=0.1)
-            for d in dilations
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                _TCNBlock_BKC(
+                    emb_ch,
+                    kernel_size=kernel_size,
+                    dilation=d,
+                    dropout=dropout,
+                    norm="ln",
+                    use_residual=True,
+                    init_scale=0.1,
+                )
+                for d in dilations
+            ]
+        )
 
     @staticmethod
     def _left_pad_to_K(x_bls: th.Tensor, K: int) -> th.Tensor:
@@ -492,22 +526,22 @@ class _TemporalEncoderFlat(nn.Module):
         S = self.state_dim
         K = self.K
         rd = random.random()
-        flg = (rd < 0.0000001)
+        flg = rd < 0.0000001
         # 仅接受最后一维存在，且是 S 的整数倍
         if x.dim() < 2:
             raise RuntimeError(f"不支持的输入形状: {tuple(x.shape)}，期望 (B,135) 或 (B,...,135)")
-        assert x.size(-1) == (S)*K
+        assert x.size(-1) == (S) * K
         if flg:
             print(x.shape)
         # 记录前置批量维，并展平到 (Bf, L, S)
-        *batch_shape, D = x.shape                 # (..., 135)
+        *batch_shape, D = x.shape  # (..., 135)
         L = (D) // S
         flat_B = int(th.tensor(batch_shape).prod().item()) if len(batch_shape) else x.shape[0]
         if flg:
-            print("flat_B= ",flat_B)
-        x_bls = x.view(flat_B, L, S)              # (Bf, L, S)
+            print("flat_B= ", flat_B)
+        x_bls = x.view(flat_B, L, S)  # (Bf, L, S)
 
-        #print(L,D,S)
+        # print(L,D,S)
 
         # 左侧零补/裁切到 (Bf, K, S)
         if L == K:
@@ -522,8 +556,8 @@ class _TemporalEncoderFlat(nn.Module):
         h = F.silu(self.step_fc1(window))
         h = F.silu(self.step_fc2(h))
         if flg:
-            print("window:",window)
-            print("h",h)
+            print("window:", window)
+            print("h", h)
 
         # TCN blocks：保持 (Bf,K,C)
         for blk in self.blocks:
@@ -536,9 +570,8 @@ class _TemporalEncoderFlat(nn.Module):
         if len(batch_shape):
             z = z.view(*batch_shape, z.size(-1))
         if flg:
-            print("Z",z.shape,z)
+            print("Z", z.shape, z)
         return z
-
 
 
 def build_tcn(
@@ -552,7 +585,7 @@ def build_tcn(
     kernel_size: int = 3,
     dilations: list[int] | None = None,
     dropout: float = 0.00,
-    activation: nn.Module = nn.SiLU,
+    activation: type[nn.Module] = nn.SiLU,
     for_q: bool = False,
     return_feature_extractor: bool = False,  # ★ 新增：True 时仅返回特征提取器
 ) -> nn.Sequential:
@@ -603,9 +636,9 @@ def build_tcn(
     return nn.Sequential(*layers)
 
 
-
-
-def build_mlp(dims: [int], activation: nn = None, if_raw_out: bool = True, use_ln: bool = False) -> nn.Sequential:
+def build_mlp(
+    dims: list[int], activation: Optional[type[nn.Module]] = None, if_raw_out: bool = True, use_ln: bool = False
+) -> nn.Sequential:
     """
     build MLP (MultiLayer Perceptron)
 
@@ -617,7 +650,7 @@ def build_mlp(dims: [int], activation: nn = None, if_raw_out: bool = True, use_l
     if activation is None:
         activation = nn.GELU
 
-    net_list = []
+    net_list: list[nn.Module] = []
 
     # 输入层可选 LayerNorm
     if use_ln:
@@ -656,9 +689,7 @@ class DenseNet(nn.Module):  # plan to hyper-param: layer_number
 
     def forward(self, x1):  # x1.shape==(-1, lay_dim*1)
         x2 = th.cat((x1, self.dense1(x1)), dim=1)
-        return th.cat(
-            (x2, self.dense2(x2)), dim=1
-        )  # x3  # x2.shape==(-1, lay_dim*4)
+        return th.cat((x2, self.dense2(x2)), dim=1)  # x3  # x2.shape==(-1, lay_dim*4)
 
 
 class ConvNet(nn.Module):  # pixel-level state encoder

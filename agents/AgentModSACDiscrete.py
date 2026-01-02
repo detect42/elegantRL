@@ -1,7 +1,8 @@
+from __future__ import annotations
 import math
 import random
 from copy import deepcopy
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, cast
 
 import numpy as np
 import torch as th
@@ -22,41 +23,41 @@ class AgentModSACDiscrete(AgentBase):
       - α 自动调节（采样式）
       - reliable_lambda + Two-time Update Rule
     """
+    act: ActorDiscreteSAC  # type: ignore[assignment]
+    act_target: ActorDiscreteSAC  # type: ignore[assignment]
+    cri: CriticEnsembleDiscrete  # type: ignore[assignment]
+    cri_target: CriticEnsembleDiscrete  # type: ignore[assignment]
 
-    def __init__(self, state_dim: int, action_dim: int, gpu_id: int = 0, args: Optional[DictConfig] = None):
+    def __init__(self, state_dim: int, action_dim: int, gpu_id: int, args: DictConfig):
         super().__init__(state_dim, action_dim, gpu_id, args)
-        K = args.env.K
         # ====================================================
         # 1. 初始化 Actor (直接传 args.agent.actor)
         # ====================================================
         self.act = ActorDiscreteSAC(
-            state_dim=state_dim, action_dim=action_dim, K=K, cfg=args.agent.actor  # <--- ★ 核心：把整块配置传进去
+            state_dim=state_dim, action_dim=action_dim, actor_cfg=args.agent.actor  # <--- ★ 核心：把整块配置传进去
         ).to(self.device)
 
         # ====================================================
         # 2. 初始化 Critic (直接传 args.agent.critic)
         # ====================================================
         self.cri = CriticEnsembleDiscrete(
-            state_dim=state_dim, action_dim=action_dim, K=K, cfg=args.agent.critic  # <--- ★ 核心：把整块配置传进去
+            state_dim=state_dim, action_dim=action_dim, critic_cfg=args.agent.critic  # <--- ★ 核心：把整块配置传进去
         ).to(self.device)
 
         self.act_target = deepcopy(self.act)
         self.cri_target = deepcopy(self.cri)
 
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), lr=self.learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), lr=self.learning_rate, weight_decay=args.train.L2_reg)
+        self.act_optimizer = th.optim.Adam(self.act.parameters(), lr=args.agent.actor_learning_rate)
+        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), lr=args.agent.critic_learning_rate, weight_decay=args.train.L2_reg)
 
         # α & 目标熵：离散建议 -log(K_actions)
         default_target_H = -float(math.log(max(action_dim, 1)))
         self.alpha_log = th.tensor((-1.0,), dtype=th.float32, requires_grad=True, device=self.device)
-        self.alpha_optim = th.optim.Adam((self.alpha_log,), lr=self.learning_rate)
-        self.target_entropy = args.get("target_entropy", default_target_H)
-
-        # critic 稳定：Huber
-        self.criterion = nn.SmoothL1Loss(reduction="none")
+        self.alpha_optim = th.optim.Adam((self.alpha_log,), lr=args.agent.alpha_learning_rate)
+        self.target_entropy = args.agent.target_entropy if args.agent.target_entropy is not None else default_target_H
 
         # reliable_lambda
-        self.critic_tau = args.get("critic_tau", 0.995)  # critic EMA
+        self.critic_tau = args.agent.critic_tau  # critic EMA
         self.critic_value = 1.0
         self.update_a = 0
 
@@ -72,7 +73,7 @@ class AgentModSACDiscrete(AgentBase):
                 )
             else:
                 state, action, reward, undone, unmask, next_state = buffer.sample(self.batch_size)
-                is_weight, is_index = None, None
+                #is_weight, is_index = None, None
 
             # 确保离散索引形状与类型
             if action.dim() > 1:
@@ -96,6 +97,7 @@ class AgentModSACDiscrete(AgentBase):
             print("Q_heads: ", Q_heads[:5].detach().cpu().numpy().round(2))
             print("q_labels: ", q_labels[:5].detach().cpu().numpy().round(2))
             print("reward: ", reward[:5].detach().cpu().numpy().round(2))
+            print("action_idx: ", action_idx[:5].detach().cpu().numpy().round(2))
 
         td_error = self.criterion(Q_heads, q_labels).mean(dim=1) * unmask  # [B]
         if self.if_use_per:
@@ -146,19 +148,19 @@ class ActorDiscreteSAC(ActorBase):
       - 否则：MLP 直接输出 logits[K]
     """
 
-    def __init__(self, state_dim: int, action_dim: int, K: int = 1, cfg: Optional[DictConfig] = None):
+    def __init__(self, state_dim: int, action_dim: int, actor_cfg: DictConfig):
         super().__init__(state_dim=state_dim, action_dim=action_dim)
 
         # 1. 解析通用参数
-        self.K = K
-        self.temp_tau = cfg.temp_tau
-        self.greedy_eps = cfg.greedy_eps
+        self.K = actor_cfg.K
+        self.temp_tau = actor_cfg.temp_tau
+        self.greedy_eps = actor_cfg.greedy_eps
 
         # 2. 决定网络类型
-        self.model_type = cfg.type.lower()  # "tcn" or "mlp"
+        self.model_type = actor_cfg.type.lower()  # "tcn" or "mlp"
 
         if self.model_type == "tcn":
-            tcn_params = OmegaConf.to_container(cfg.tcn_args, resolve=True)
+            tcn_params = cast(dict[str, Any], OmegaConf.to_container(actor_cfg.tcn_args, resolve=True))
             # 只要特征：return_feature_extractor=True
             self.feat_extractor = build_tcn(
                 state_dim=state_dim,
@@ -173,7 +175,7 @@ class ActorDiscreteSAC(ActorBase):
             self.policy_head = build_mlp([in_dim, *tcn_params["net_dims"], 32, action_dim])
         elif self.model_type == "mlp":
             # 纯 MLP
-            net_dim = cfg.mlp_args.net_dims
+            net_dim = actor_cfg.mlp_args.net_dims
             self.backbone = build_mlp([state_dim, *net_dim])
             self.policy_head = build_mlp([net_dim[-1], action_dim])
         else:
@@ -188,6 +190,8 @@ class ActorDiscreteSAC(ActorBase):
         elif self.model_type == "mlp":
             h = self.backbone(state)
             logits = self.policy_head(h)
+        else: # should not reach here
+            raise ValueError(f"Unknown model type: {self.model_type}")
         return logits
 
     def policy(self, state: TEN) -> Tuple[TEN, TEN]:
@@ -241,19 +245,19 @@ class CriticEnsembleDiscrete(nn.Module):
       - TCN：共享 TCN 特征抽取器 -> per-head decoder -> K 维
     """
 
-    def __init__(self, state_dim: int, action_dim: int, K: int = 1, cfg: Optional[DictConfig] = None):
+    def __init__(self, state_dim: int, action_dim: int, critic_cfg: DictConfig):
         super().__init__()
-        self.K = K
+        self.K = critic_cfg.K
         self.action_dim = action_dim  # K_actions（离散动作数）
-        self.num_ensembles = cfg.num_ensembles
-        self.state_noise_std = cfg.state_noise_std
+        self.num_ensembles = critic_cfg.num_ensembles
+        self.state_noise_std = critic_cfg.state_noise_std
         # 2. 决定网络类型
-        self.model_type = cfg.type.lower()
+        self.model_type = critic_cfg.type.lower()
 
         if self.model_type == "mlp":
             # MLP 共享编码（注意：如果你的状态是 K 个时间片拼接，这里只取最后一个片段）
-            net_dims = cfg.mlp_args.net_dims
-            self.state_single_len = state_dim // K
+            net_dims = critic_cfg.mlp_args.net_dims
+            self.state_single_len = state_dim // self.K
 
             self.encoder_s = build_mlp([self.state_single_len, net_dims[0]])
             self.decoders = nn.ModuleList()
@@ -263,15 +267,15 @@ class CriticEnsembleDiscrete(nn.Module):
                 self.decoders.append(dec)
         if self.model_type == "tcn":
             # 共享 TCN 特征抽取
-            tcn_params = OmegaConf.to_container(cfg.tcn_args, resolve=True)
+            tcn_params = cast(dict[str, Any], OmegaConf.to_container(critic_cfg.tcn_args, resolve=True))
             self.feat_extractor = build_tcn(
                 state_dim=state_dim,
                 action_dim=0,
-                K=K,
-                **tcn_params,
+                K=self.K,
                 activation=nn.SiLU,
                 for_q=False,
                 return_feature_extractor=True,
+                **tcn_params,
             )
             in_dim = tcn_params["emb_ch"]
             net_dims = tcn_params["net_dims"]
@@ -289,6 +293,8 @@ class CriticEnsembleDiscrete(nn.Module):
             return feat
         elif self.model_type == "tcn":
             return self.feat_extractor(state)
+        else:
+            raise ValueError(f"Unknown model type: {self.model_type}")
 
     def get_q_all(self, state: TEN) -> TEN:
         """

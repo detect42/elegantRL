@@ -6,6 +6,7 @@ import multiprocessing as mp
 from copy import deepcopy
 from typing import List, Optional
 from multiprocessing import Process, Pipe
+from multiprocessing.connection import Connection
 import numpy.random as rd
 from .config import build_env
 from .replay_buffer import ReplayBuffer
@@ -215,10 +216,10 @@ def train_agent_multiprocessing_multi_gpu(args: DictConfig):
 class Learner(Process):
     def __init__(
         self,
-        learner_pipe: Pipe,
-        worker_pipes: List[Pipe],
-        evaluator_pipe: Pipe,
-        learners_pipe: Optional[List[Pipe]] = None,
+        learner_pipe: tuple[Connection, Connection],
+        worker_pipes: List[tuple[Connection, Connection]],
+        evaluator_pipe: tuple[Connection, Connection],
+        learners_pipe: Optional[List[tuple[Connection, Connection]]] = None,
         args: Optional[DictConfig] = None,
     ):
         super().__init__()
@@ -249,8 +250,9 @@ class Learner(Process):
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
+        if_off_policy = args.agent.if_off_policy
         """Learner init buffer"""
-        if args.agent.if_off_policy:
+        if if_off_policy:
             buffer = ReplayBuffer(
                 gpu_id=args.sys.gpu_id,
                 num_seqs=args.env.num_envs * args.sys.num_workers * num_learners,
@@ -264,8 +266,6 @@ class Learner(Process):
         else:
             buffer = []
 
-        """loop"""
-        if_off_policy = args.agent.if_off_policy
         if_discrete = args.env.if_discrete
         if_save_buffer = args.eval.if_save_buffer
 
@@ -379,7 +379,7 @@ class Learner(Process):
 
 
 class Worker(Process):
-    def __init__(self, worker_pipe: Pipe, learner_pipe: Pipe, worker_id: int, args: Optional[DictConfig] = None):
+    def __init__(self, worker_pipe: tuple[Connection, Connection], learner_pipe: tuple[Connection, Connection], worker_id: int, args: Optional[DictConfig] = None):
         super().__init__()
         self.recv_pipe = worker_pipe[0]
         self.send_pipe = learner_pipe[1]
@@ -447,7 +447,7 @@ class Worker(Process):
 
 
 class EvaluatorProc(Process):
-    def __init__(self, evaluator_pipe: Pipe, args: Optional[DictConfig] = None):
+    def __init__(self, evaluator_pipe: tuple[Connection, Connection], args: Optional[DictConfig] = None):
         super().__init__()
         self.pipe0 = evaluator_pipe[0]
         self.pipe1 = evaluator_pipe[1]
