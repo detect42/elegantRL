@@ -4,7 +4,7 @@ import numpy as np
 import torch as th
 import multiprocessing as mp
 from copy import deepcopy
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple, cast, Union
 from multiprocessing import Process, Pipe
 from multiprocessing.connection import Connection
 import numpy.random as rd
@@ -165,8 +165,8 @@ def train_agent_multiprocessing(args: DictConfig):
 
     """start Process with single GPU"""
     process_list = [learner, *workers, evaluator]
-    [process.start() for process in process_list]
-    [process.join() for process in process_list]
+    for p in process_list: p.start()
+    for p in process_list: p.join()
 
 
 def train_agent_multiprocessing_multi_gpu(args: DictConfig):
@@ -207,10 +207,13 @@ def train_agent_multiprocessing_multi_gpu(args: DictConfig):
 
     """Process start"""
     for process_list in process_list_list:
-        [process.start() for process in process_list]
+        for process in process_list:
+            process.start()
+
     """Process join"""
     for process_list in process_list_list:
-        [process.join() for process in process_list]
+        for process in process_list:
+            process.join()
 
 
 class Learner(Process):
