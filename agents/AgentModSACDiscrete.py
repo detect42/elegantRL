@@ -23,6 +23,7 @@ class AgentModSACDiscrete(AgentBase):
       - α 自动调节（采样式）
       - reliable_lambda + Two-time Update Rule
     """
+
     act: ActorDiscreteSAC  # type: ignore[assignment]
     act_target: ActorDiscreteSAC  # type: ignore[assignment]
     cri: CriticEnsembleDiscrete  # type: ignore[assignment]
@@ -48,7 +49,9 @@ class AgentModSACDiscrete(AgentBase):
         self.cri_target = deepcopy(self.cri)
 
         self.act_optimizer = th.optim.Adam(self.act.parameters(), lr=args.agent.actor_learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), lr=args.agent.critic_learning_rate, weight_decay=args.train.L2_reg)
+        self.cri_optimizer = th.optim.Adam(
+            self.cri.parameters(), lr=args.agent.critic_learning_rate, weight_decay=args.train.L2_reg
+        )
 
         # α & 目标熵：离散建议 -log(K_actions)
         default_target_H = -float(math.log(max(action_dim, 1)))
@@ -73,7 +76,7 @@ class AgentModSACDiscrete(AgentBase):
                 )
             else:
                 state, action, reward, undone, unmask, next_state = buffer.sample(self.batch_size)
-                #is_weight, is_index = None, None
+                # is_weight, is_index = None, None
 
             # 确保离散索引形状与类型
             if action.dim() > 1:
@@ -93,7 +96,7 @@ class AgentModSACDiscrete(AgentBase):
         Q_heads = self.cri.get_q_values(state, action_idx)  # [B,N], N is num_ensembles
 
         q_labels = q_label.view((-1, 1)).repeat(1, Q_heads.shape[1])
-        if random.random() < 0.05:
+        if random.random() < 0.001:
             print("Q_heads: ", Q_heads[:5].detach().cpu().numpy().round(2))
             print("q_labels: ", q_labels[:5].detach().cpu().numpy().round(2))
             print("reward: ", reward[:5].detach().cpu().numpy().round(2))
@@ -190,7 +193,7 @@ class ActorDiscreteSAC(ActorBase):
         elif self.model_type == "mlp":
             h = self.backbone(state)
             logits = self.policy_head(h)
-        else: # should not reach here
+        else:  # should not reach here
             raise ValueError(f"Unknown model type: {self.model_type}")
         return logits
 

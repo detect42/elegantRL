@@ -13,7 +13,7 @@ from .replay_buffer import ReplayBuffer
 from .evaluator import Evaluator
 from .evaluator import get_rewards_and_steps
 from omegaconf import DictConfig, OmegaConf
-from .config import get_class_from_path  # 引入那个智能加载函数
+from hydra.utils import instantiate, get_class
 
 if os.name == "nt":  # if is WindowOS (Windows NT)
     """Fix bug about Anaconda in WindowOS
@@ -43,11 +43,11 @@ def train_agent_single_process(args: DictConfig):
     th.set_grad_enabled(False)
 
     """init environment"""
-    env_class = get_class_from_path(args.env.class_name)
+    env_class = get_class(args.env._target_)
     env = build_env(env_class, args.env, args.sys.gpu_id)
 
     """init agent"""
-    agent_class = get_class_from_path(args.agent.agent_name)
+    agent_class = get_class(args.agent._target_)
     agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
     if args.train.continue_train:
         agent.save_or_load_agent(args.eval.cwd, if_save=False)
@@ -80,11 +80,10 @@ def train_agent_single_process(args: DictConfig):
         buffer = []
 
     """init evaluator"""
-    eval_env_class = args.eval.env_class if args.eval.env_class else args.env_class
-    eval_env_class = get_class_from_path(eval_env_class)
-    eval_env_cfg = args.eval.env if args.eval.env_class else args.env
+    eval_env_class = get_class(args.eval.env._target_)
+    eval_env_cfg = args.eval.env
     eval_env = build_env(eval_env_class, eval_env_cfg, args.sys.gpu_id)
-    evaluator = Evaluator(cwd=args.eval.cwd, env=eval_env, args=args, if_tensorboard=False)
+    evaluator = Evaluator(cwd=args.eval.cwd, env=eval_env, args=args, if_tensorboard=True)
 
     """train loop"""
     cwd = args.eval.cwd
@@ -165,8 +164,10 @@ def train_agent_multiprocessing(args: DictConfig):
 
     """start Process with single GPU"""
     process_list = [learner, *workers, evaluator]
-    for p in process_list: p.start()
-    for p in process_list: p.join()
+    for p in process_list:
+        p.start()
+    for p in process_list:
+        p.join()
 
 
 def train_agent_multiprocessing_multi_gpu(args: DictConfig):
@@ -248,8 +249,15 @@ class Learner(Process):
             ValueError("| Learner: suggest to set `args.sys.learner_gpu_ids=()` in default")
 
         """Learner init agent"""
-        agent_class = get_class_from_path(args.agent.agent_name)
-        agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+        # agent_class = get_class_from_path(args.agent.agent_name)
+        # agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+        agent_class = get_class(args.agent._target_)
+        agent = agent_class(
+            state_dim=args.env.state_dim,
+            action_dim=args.env.action_dim,
+            gpu_id=args.sys.gpu_id,
+            args=args,
+        )
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
@@ -382,7 +390,13 @@ class Learner(Process):
 
 
 class Worker(Process):
-    def __init__(self, worker_pipe: tuple[Connection, Connection], learner_pipe: tuple[Connection, Connection], worker_id: int, args: Optional[DictConfig] = None):
+    def __init__(
+        self,
+        worker_pipe: tuple[Connection, Connection],
+        learner_pipe: tuple[Connection, Connection],
+        worker_id: int,
+        args: Optional[DictConfig] = None,
+    ):
         super().__init__()
         self.recv_pipe = worker_pipe[0]
         self.send_pipe = learner_pipe[1]
@@ -395,12 +409,12 @@ class Worker(Process):
         th.set_grad_enabled(False)
 
         """init environment"""
-        env_class = get_class_from_path(args.env.class_name)
+        env_class = get_class(args.env._target_)
         # print(env_class)
         env = build_env(env_class, args.env, args.sys.gpu_id)
 
         """init agent"""
-        agent_class = get_class_from_path(args.agent.agent_name)
+        agent_class = get_class(args.agent._target_)
         agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
@@ -424,17 +438,20 @@ class Worker(Process):
 
         """loop"""
         del args
-        #import time  #!
+        # import time  #!
         th.set_num_threads(1)
         from threadpoolctl import threadpool_limits
-        with threadpool_limits(limits=1, user_api='blas'):
+
+        with threadpool_limits(limits=1, user_api="blas"):
             while True:
                 """Worker receive actor from Learner"""
                 actor = self.recv_pipe.recv()
                 if actor is None:
                     break
-                agent.act = actor.to(agent.device) if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
-                #t0 = time.time()  #!
+                agent.act = (
+                    actor.to(agent.device) if os.name == "nt" else actor
+                )  # WindowsNT_OS can only send cpu_tensor
+                # t0 = time.time()  #!
                 """Worker send the training data to Learner"""
                 buffer_items = agent.explore_env(env, horizon_len)
                 last_state = agent.last_state
@@ -442,8 +459,8 @@ class Worker(Process):
                     buffer_items = [t.cpu() for t in buffer_items]
                     last_state = deepcopy(last_state).cpu()
                 self.send_pipe.send((worker_id, buffer_items, last_state))
-                #t1 = time.time()  #!
-                #print(f"| Worker-{worker_id} Explore Time: {t1 - t0:.3f}s", flush=True)  #!
+                # t1 = time.time()  #!
+                # print(f"| Worker-{worker_id} Explore Time: {t1 - t0:.3f}s", flush=True)  #!
 
         env.close() if hasattr(env, "close") else None
         print(f"| Worker-{self.worker_id} Closed", flush=True)
@@ -461,9 +478,8 @@ class EvaluatorProc(Process):
         th.set_grad_enabled(False)
 
         """init evaluator"""
-        eval_env_class_name = args.eval.env.class_name if args.eval.env.class_name else args.env.class_name
-        eval_env_class = get_class_from_path(eval_env_class_name)
-        eval_env_cfg = args.eval.env if args.eval.env.class_name else args.env
+        eval_env_class = get_class(args.eval.env._target_)
+        eval_env_cfg = args.eval.env
         eval_env = build_env(eval_env_class, eval_env_cfg, args.sys.gpu_id)
         evaluator = Evaluator(cwd=args.eval.cwd, env=eval_env, args=args, if_tensorboard=True)
 

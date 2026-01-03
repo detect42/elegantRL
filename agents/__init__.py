@@ -1,5 +1,6 @@
 from .AgentBase import AgentBase
 from .AgentModSACDiscrete import AgentModSACDiscrete
+from .AgentPPO import AgentPPO, AgentDiscretePPO
 """
 # DQN (off-policy)
 from .AgentDQN import AgentDQN, AgentDuelingDQN

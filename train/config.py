@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple, Type
 import numpy as np
 import torch as th
 from omegaconf import DictConfig, OmegaConf
+from hydra.core.hydra_config import HydraConfig
 
 TEN = th.Tensor
 
@@ -81,7 +82,7 @@ def init_before_training(cfg: DictConfig):
 
     # 3. 记录 CWD (Current Working Directory)
     # Hydra 已经切换了目录，这里记录一下供 Agent 保存模型用
-    current_log_dir = os.getcwd()
+    current_log_dir = HydraConfig.get().runtime.output_dir
 
     # 临时解锁写入 cwd
     OmegaConf.set_struct(cfg, False)
@@ -95,23 +96,9 @@ def init_before_training(cfg: DictConfig):
 # ================================================================
 # 辅助工具
 # ================================================================
-def get_class_from_path(path: str):
-    """根据字符串路径加载类"""
-    try:
-        if "." in path:
-            module_path, class_name = path.rsplit(".", 1)
-            module = importlib.import_module(module_path)
-            return getattr(module, class_name)
-        else:
-            # 默认尝试从 elegantrl.agents 找
-            import elegantrl.agents
-
-            return getattr(elegantrl.agents, path)
-    except (ImportError, AttributeError) as e:
-        raise ImportError(f"Cannot import class: {path}. {e}")
 
 
-def build_env(env_class=None, cfg: Optional[DictConfig] = None, gpu_id: int = -1):
+def build_env(env_class, cfg: DictConfig, gpu_id: int = -1):
     import warnings
 
     warnings.filterwarnings("ignore", message=".*get variables from other wrappers is deprecated.*")
