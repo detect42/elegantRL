@@ -403,7 +403,6 @@ class ActorDiscretePPO(ActorPPO):
         - ε-greedy：与均匀分布混合，防塌
         - 其余保持你原框架一致（Categorical）
         """
-        # ★ 关键：把 K 传给父类（你的 ActorPPO 需要 K）
         super().__init__(state_dim=state_dim, action_dim=action_dim, cfg=cfg)
 
         # ★ 连续版里无用的高斯参数，删除以免被优化器更新

@@ -50,6 +50,12 @@ def process_config(cfg: DictConfig) -> DictConfig:
         is_off_policy = all(name not in agent_name for name in on_policy_names)
         cfg.agent.if_off_policy = is_off_policy
 
+    # [Step 4] 逻辑 C: 保存hydra的log dir
+    current_log_dir = HydraConfig.get().runtime.output_dir
+    cfg.eval.cwd = current_log_dir
+
+    # [Step 5] 逻辑 D: 随机种子
+    cfg.sys.random_seed = cfg.sys.random_seed if cfg.sys.random_seed is not None else max(0, cfg.sys.gpu_id)
     # [Step 4] 关锁：处理完毕，禁止后续代码随意添加新 Key，防止拼写错误
     OmegaConf.set_struct(cfg, True)
 
@@ -65,13 +71,7 @@ def init_before_training(cfg: DictConfig):
     """
     # 1. 随机种子
     seed = cfg.sys.random_seed
-    if seed is None:
-        seed = max(0, cfg.sys.gpu_id)  # 默认用 GPU ID
-
-        # 因为我们之前关锁了，这里临时解锁修改一下 seed
-        OmegaConf.set_struct(cfg, False)
-        cfg.sys.random_seed = seed
-        OmegaConf.set_struct(cfg, True)
+    assert isinstance(seed, int) and (seed >= 0)
 
     np.random.seed(seed)
     th.manual_seed(seed)
@@ -79,15 +79,6 @@ def init_before_training(cfg: DictConfig):
     # 2. PyTorch 线程
     th.set_num_threads(cfg.sys.num_threads)
     th.set_default_dtype(th.float32)
-
-    # 3. 记录 CWD (Current Working Directory)
-    # Hydra 已经切换了目录，这里记录一下供 Agent 保存模型用
-    current_log_dir = HydraConfig.get().runtime.output_dir
-
-    # 临时解锁写入 cwd
-    OmegaConf.set_struct(cfg, False)
-    cfg.eval.cwd = current_log_dir
-    OmegaConf.set_struct(cfg, True)
 
     print(f"| Init: Seed={seed}, Threads={cfg.sys.num_threads}")
     print(f"| Init: CWD={cfg.eval.cwd}")
