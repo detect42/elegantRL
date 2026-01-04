@@ -128,7 +128,7 @@ class FutureExecEnv:
         self.total_time = self.end_time - self.begin_time
         self.uncompleted = False
         self.cum_reward = 0.0
-        assert self.state_dim % self.K == 0, "state_dim must be divisible by K"
+        assert self.state_dim % self.K == 0, f"state_dim={self.state_dim} must be divisible by K={self.K}"
         self.history.clear()
         # 构造 position DataFrame
         times = np.arange(self.begin_time, self.end_time + 1, self.freq)  #! 注意data里面 结尾没有按照5s对齐

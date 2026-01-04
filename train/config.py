@@ -30,6 +30,7 @@ def process_config(cfg: DictConfig) -> DictConfig:
     # 比如 state_dim = 15 * K
     if cfg.env.get("K") is not None:
         cfg.env.state_dim = cfg.env.state_dim * cfg.env.K
+        cfg.eval.env.state_dim = cfg.env.state_dim
         print(f"| Config: Derived state_dim={cfg.env.state_dim}")
 
     cfg.train.batch_size = cfg.train.batch_size * cfg.train.kk

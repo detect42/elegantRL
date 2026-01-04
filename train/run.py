@@ -154,7 +154,7 @@ def train_agent_multiprocessing(args: DictConfig):
     evaluator_pipe = Pipe(duplex=True)
 
     """build Process"""
-    learner = Learner(learner_pipe=learner_pipe, worker_pipes=worker_pipes, evaluator_pipe=evaluator_pipe, args=args)
+    learner = Learner(learner_pipe=learner_pipe, worker_pipes=worker_pipes, evaluator_pipe=evaluator_pipe,learners_pipe=None, args=args)
     workers = [
         Worker(worker_pipe=worker_pipe, learner_pipe=learner_pipe, worker_id=worker_id, args=args)
         for worker_id, worker_pipe in enumerate(worker_pipes)
