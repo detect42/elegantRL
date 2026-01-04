@@ -68,7 +68,30 @@ class AgentModSACDiscrete(AgentBase):
         # 环境交互：返回离散索引（Long）
         return self.act.get_action(state)
 
-    def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> Tuple[float, float]:
+    def update_net(self, buffer: ReplayBuffer) -> dict[str, float]:
+
+        #! on-policy算法比如ppo 这里的buffer就是tuple，不是class，所以需要在对应子类agent redefine这个function
+        objs_critic = []
+        objs_actor = []
+        objs_entropy = []
+        if self.lambda_fit_cum_r != 0:
+            buffer.update_cum_rewards(get_cumulative_rewards=self.get_cumulative_rewards)
+
+        th.set_grad_enabled(True)
+        update_times = int(buffer.cur_size * buffer.num_seqs * self.repeat_times / self.batch_size)  #! add * num_seqs
+        for update_t in range(update_times):
+            obj_critic, obj_actor, current_entropy = self.update_objectives(buffer=buffer, update_t=update_t)
+            objs_critic.append(obj_critic)
+            objs_actor.append(obj_actor) if isinstance(obj_actor, float) else None
+            objs_entropy.append(current_entropy)
+        th.set_grad_enabled(False)
+
+        obj_avg_critic = np.array(objs_critic).mean() if len(objs_critic) else 0.0
+        obj_avg_actor = np.nanmean(np.array(objs_actor)) if len(objs_actor) else 0.0
+        obj_avg_entropy = np.array(objs_entropy).mean() if len(objs_entropy) else 0.0
+        return {"obj_critic_avg": obj_avg_critic, "obj_actor_avg": obj_avg_actor, "current_entropy": obj_avg_entropy}
+
+    def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> Tuple[float, float, float]:
         with th.no_grad():
             if self.if_use_per:
                 (state, action, reward, undone, unmask, next_state, is_weight, is_index) = buffer.sample_for_per(
@@ -96,12 +119,11 @@ class AgentModSACDiscrete(AgentBase):
         Q_heads = self.cri.get_q_values(state, action_idx)  # [B,N], N is num_ensembles
 
         q_labels = q_label.view((-1, 1)).repeat(1, Q_heads.shape[1])
-        if random.random() < 0.001:
+        if random.random() < 0.0001:
             print("Q_heads: ", Q_heads[:5].detach().cpu().numpy().round(2))
             print("q_labels: ", q_labels[:5].detach().cpu().numpy().round(2))
             print("reward: ", reward[:5].detach().cpu().numpy().round(2))
             print("action_idx: ", action_idx[:5].detach().cpu().numpy().round(2))
-
         td_error = self.criterion(Q_heads, q_labels).mean(dim=1) * unmask  # [B]
         if self.if_use_per:
             obj_critic = (td_error * is_weight).mean()
@@ -116,7 +138,7 @@ class AgentModSACDiscrete(AgentBase):
         _, logprob_sampled = self.act.get_action_logprob(state)  # [B]
         obj_alpha = (self.alpha_log * (self.target_entropy - logprob_sampled).detach()).mean()
         self.optimizer_backward(self.alpha_optim, obj_alpha)
-
+        current_entropy = -logprob_sampled.mean().item()
         # ---- actor：期望目标 + reliable_lambda TTUR ----
         with th.no_grad():
             self.alpha_log[:] = self.alpha_log.clamp(-5, 1)
@@ -127,7 +149,6 @@ class AgentModSACDiscrete(AgentBase):
         reliable_lambda = math.exp(-self.critic_value**2)
         self.update_a = 0 if update_t == 0 else self.update_a
         ratio = (self.update_a / (update_t + 1)) if (update_t + 1) > 0 else 0.0
-
         if ratio < (1.0 / (2.0 - reliable_lambda)):
             self.update_a += 1
             # 期望：sum_a π(a|s) [ α logπ(a|s) - Qmin(s,a) ]
@@ -135,13 +156,14 @@ class AgentModSACDiscrete(AgentBase):
             probs, log_probs = self.act.policy(state)  # [B,K]
             Qmin = self.cri_target.get_q_all(state).min(dim=1)[0]  # [B,K]
             actor_loss = (probs * (alpha_detach * log_probs - Qmin)).sum(dim=1).mean()
+            # print(probs,"\n",alpha_detach,"\n",log_probs,"\n",Qmin)
             self.optimizer_backward(self.act_optimizer, actor_loss)
             self.soft_update(self.act_target, self.act, self.soft_update_tau)
             obj_actor = -actor_loss.detach().item()  # 为了与连续版返回“越大越好”的一致性
         else:
             obj_actor = float("nan")
 
-        return obj_critic.item(), obj_actor
+        return obj_critic.item(), obj_actor, current_entropy
 
 
 class ActorDiscreteSAC(ActorBase):

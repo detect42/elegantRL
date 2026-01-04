@@ -73,7 +73,7 @@ class FutureExecEnv:
         self.sample_pool = sample_data[:]
         self.sample_pool_size = len(self.sample_pool)
         eval_data = json.load(open(f"/code/srwang/Finrl/sample_pool/1_eval_data.json", "r"))
-        self.eval_pool = eval_data[:]
+        self.eval_pool = eval_data[:50000]
         self.eval_pool_size = len(self.eval_pool)
         self.begin_time = 0
         self.end_time = 0

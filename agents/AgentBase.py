@@ -183,7 +183,7 @@ class AgentBase:
         unmasks = th.logical_not(truncates)
         return states, actions, rewards, undones, unmasks
 
-    def update_net(self, buffer: ReplayBuffer) -> tuple[float, ...]:  #! on-policy算法比如ppo 这里的buffer就是tuple，不是class，所以需要在对应子类agent redefine这个function
+    def update_net(self, buffer: ReplayBuffer) -> dict[str, float]:  #! on-policy算法比如ppo 这里的buffer就是tuple，不是class，所以需要在对应子类agent redefine这个function
         objs_critic = []
         objs_actor = []
 
@@ -191,7 +191,7 @@ class AgentBase:
             buffer.update_cum_rewards(get_cumulative_rewards=self.get_cumulative_rewards)
 
         th.set_grad_enabled(True)
-        update_times = int(buffer.cur_size * self.repeat_times / self.batch_size)
+        update_times = int(buffer.cur_size * buffer.num_seqs * self.repeat_times / self.batch_size) #! add * num_seqs
         for update_t in range(update_times):
             obj_critic, obj_actor = self.update_objectives(buffer=buffer, update_t=update_t)
             objs_critic.append(obj_critic)
@@ -200,7 +200,7 @@ class AgentBase:
 
         obj_avg_critic = np.array(objs_critic).mean() if len(objs_critic) else 0.0
         obj_avg_actor = np.array(objs_actor).mean() if len(objs_actor) else 0.0
-        return obj_avg_critic, obj_avg_actor
+        return {"obj_critic_avg": obj_avg_critic, "obj_actor_avg": obj_avg_actor}
 
     def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> tuple[float, ...]:
         assert isinstance(update_t, int)

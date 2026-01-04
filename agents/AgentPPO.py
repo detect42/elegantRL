@@ -4,7 +4,7 @@ PPO algorithm + GAE
 
 from __future__ import annotations
 import random
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 from omegaconf import DictConfig
 import numpy as np
 import torch as th
@@ -146,7 +146,7 @@ class AgentPPO(AgentBase):
         actions, logprobs = self.act.get_action(state)
         return actions, logprobs
 
-    def update_net(self, buffer) -> tuple[float, float, float]:
+    def update_net(self, buffer) -> Dict[str, float]:
         buffer_size = buffer[0].shape[0]
 
         """get advantages reward_sums"""
@@ -184,7 +184,7 @@ class AgentPPO(AgentBase):
         obj_entropy_avg = np.array(obj_entropies).mean() if len(obj_entropies) else 0.0
         obj_critic_avg = np.array(obj_critics).mean() if len(obj_critics) else 0.0
         obj_actor_avg = np.array(obj_actors).mean() if len(obj_actors) else 0.0
-        return obj_critic_avg, obj_actor_avg, obj_entropy_avg
+        return {"obj_critic_avg": obj_critic_avg, "obj_actor_avg": obj_actor_avg, "obj_entropy_avg": obj_entropy_avg}
 
     def update_objectives(self, buffer: tuple[TEN, ...], update_t: int) -> tuple[float, ...]:
         states, actions, unmasks, logprobs, advantages, reward_sums = buffer
@@ -237,12 +237,12 @@ class AgentPPO(AgentBase):
         next_value = self.cri(next_state).detach().squeeze(-1)
 
         advantage = th.zeros_like(next_value)  # last advantage value by GAE (Generalized Advantage Estimate)
-        if self.if_use_v_trace:  # get advantage value in reverse time series (V-trace)
+        if self.if_use_v_trace:  # get advantage value in reverse time series (V-trace) #! 用V(s') + step_reward - V(s) 估计adv
             for t in range(horizon_len - 1, -1, -1):
                 next_value = rewards[t] + masks[t] * next_value
                 advantages[t] = advantage = next_value - values[t] + masks[t] * self.lambda_gae_adv * advantage
                 next_value = values[t]
-        else:  # get advantage value using the estimated value of critic network
+        else:  # get advantage value using the estimated value of critic network #! 简言之就是用真实的反向累计reward
             for t in range(horizon_len - 1, -1, -1):
                 advantages[t] = rewards[t] - values[t] + masks[t] * advantage
                 advantage = values[t] + self.lambda_gae_adv * advantages[t]
@@ -264,69 +264,6 @@ class AgentPPO(AgentBase):
         self.act_target.state_std[:] = self.act.state_std
         self.cri_target.state_avg[:] = self.cri.state_avg
         self.cri_target.state_std[:] = self.cri.state_std"""
-
-
-class AgentA2C(AgentPPO):
-    """A2C algorithm.
-    “Asynchronous Methods for Deep Reinforcement Learning”. 2016.
-    """
-
-    def update_net(self, buffer) -> tuple[float, float, float]:
-        buffer_size = buffer[0].shape[0]
-
-        """get advantages reward_sums"""
-        with th.no_grad():
-            states, actions, logprobs, rewards, undones, unmasks = buffer
-            bs = max(1, 2**10 // self.num_envs)  # set a smaller 'batch_size' to avoid CUDA OOM
-            values_list = [self.cri(states[i : i + bs]) for i in range(0, buffer_size, bs)]
-            values = th.cat(values_list, dim=0).squeeze(-1)  # values.shape == (buffer_size, )
-
-            advantages = self.get_advantages(states, rewards, undones, unmasks, values)  # shape == (buffer_size, )
-            reward_sums = advantages + values  # reward_sums.shape == (buffer_size, )
-            del rewards, undones, values
-
-            advantages = (advantages - advantages.mean()) / (advantages[::4, ::4].std() + 1e-5)  # avoid CUDA OOM
-            assert logprobs.shape == advantages.shape == reward_sums.shape == (buffer_size, states.shape[1])
-        buffer = states, actions, unmasks, logprobs, advantages, reward_sums
-
-        """update network"""
-        obj_critics = []
-        obj_actors = []
-
-        th.set_grad_enabled(True)
-        update_times = int(buffer_size * self.repeat_times / self.batch_size)
-        assert update_times >= 1
-        for update_t in range(update_times):
-            obj_critic, obj_actor = self.update_objectives(buffer, update_t)
-            obj_critics.append(obj_critic)
-            obj_actors.append(obj_actor)
-        th.set_grad_enabled(False)
-
-        obj_critic_avg = np.array(obj_critics).mean() if len(obj_critics) else 0.0
-        obj_actor_avg = np.array(obj_actors).mean() if len(obj_actors) else 0.0
-        return obj_critic_avg, obj_actor_avg, 0
-
-    def update_objectives(self, buffer: tuple[TEN, ...], update_t: int) -> tuple[float, float]:
-        states, actions, unmasks, logprobs, advantages, reward_sums = buffer
-
-        buffer_size = states.shape[0]
-        indices = th.randint(buffer_size, size=(self.batch_size,), requires_grad=False)
-        state = states[indices]
-        action = actions[indices]
-        unmask = unmasks[indices]
-        # logprob = logprobs[indices]
-        advantage = advantages[indices]
-        reward_sum = reward_sums[indices]
-
-        value = self.cri(state).squeeze(1)  # critic network predicts the reward_sum (Q value) of state
-        obj_critic = (self.criterion(value, reward_sum) * unmask).mean()
-        self.optimizer_backward(self.cri_optimizer, obj_critic)
-
-        new_logprob, obj_entropy = self.act.get_logprob_entropy(state, action)
-        obj_actor = (advantage * new_logprob).mean()  # obj_actor without policy gradient clip
-        self.optimizer_backward(self.act_optimizer, -obj_actor)
-        return obj_critic.item(), obj_actor.item()
-
 
 class AgentDiscretePPO(AgentPPO):
     def __init__(self, state_dim: int, action_dim: int, gpu_id: int, args: DictConfig):

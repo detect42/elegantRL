@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List, Tuple
+from typing import List, Tuple,Dict
 import time
 import numpy as np
 import torch as th
@@ -31,7 +31,6 @@ def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
                 # === 核心修改：传入 seq 参数 ===
                 # 假设您的 env.reset 支持 seq 参数
                 state, _ = env.reset(set_id=set_id, eval_mode=True)
-
                 cumulative_returns = 0.0
                 episode_steps = 0
 
@@ -108,7 +107,7 @@ class Evaluator:
         else:
             self.tensorboard = None
 
-    def evaluate_and_save(self, actor: th.nn, steps: int, exp_r: float, logging_tuple: tuple):
+    def evaluate_and_save(self, actor: th.nn.Module, steps: int, exp_r: float, logging_dict: Dict[str,float]):
         # print("now_steps=",self.total_step,"eval_step_counter= ",self.eval_step_counter," target_steps:",self.eval_step_counter + self.eval_per_step, " add steps->",steps," exp_r->",exp_r,flush=True)
 
         self.total_step += steps  # update total training steps
@@ -120,28 +119,35 @@ class Evaluator:
         self.eval_step_counter = self.total_step
         rewards_step_ten = self.get_cumulative_rewards_and_step(actor)
         print(rewards_step_ten.shape, flush=True)  # p
-        returns = rewards_step_ten[:, 0]  # episodic cumulative returns of an
-        steps = rewards_step_ten[:, 1]  # episodic step number
-        avg_r = returns.mean().item()
-        std_r = returns.std().item()
-        avg_s = steps.mean().item()
-        std_s = steps.std().item()
-
+        eval_returns = rewards_step_ten[:, 0]  # episodic cumulative returns of an
+        eval_steps = rewards_step_ten[:, 1]  # episodic step number
+        avg_r = eval_returns.mean().item()
+        std_r = eval_returns.std().item()
+        avg_s = eval_steps.mean().item()
+        std_s = eval_steps.std().item()
         train_time = int(time.time() - self.start_time)
-        value_tuple = [v for v in logging_tuple if isinstance(v, (int, float))]
-        logging_str = logging_tuple[-1]
+        obj_critic_avg = logging_dict["obj_critic_avg"]
+        obj_actor_avg = logging_dict["obj_actor_avg"]
+        value_tuple = [v for v in logging_dict.values() if isinstance(v, (int, float))]
+        logging_str = logging_dict.get("action_show_str", "")
 
         """record the training information"""
         self.recorder.append((self.total_step, avg_r, std_r, exp_r, *value_tuple))  # update recorder
         if self.tensorboard:
-            self.tensorboard.add_scalar("info/critic_loss_sample", value_tuple[0], self.total_step)
-            self.tensorboard.add_scalar("info/actor_obj_sample", -1 * value_tuple[1], self.total_step)
+            self.tensorboard.add_scalar("info/critic_loss_sample", obj_critic_avg, self.total_step)
+            self.tensorboard.add_scalar("info/actor_obj_sample", -1 * obj_actor_avg, self.total_step)
             self.tensorboard.add_scalar("reward/avg_reward_sample", avg_r, self.total_step)
             self.tensorboard.add_scalar("reward/std_reward_sample", std_r, self.total_step)
             self.tensorboard.add_scalar("reward/exp_reward_sample", exp_r, self.total_step)
+            self.tensorboard.add_scalar("step/avg_step", avg_s, self.total_step)
+            self.tensorboard.add_scalar("step/std_step", std_s, self.total_step)
+            if "obj_entropy_avg" in logging_dict:
+                self.tensorboard.add_scalar("info/entropy_avg_sample", logging_dict["obj_entropy_avg"], self.total_step)
+            if "current_entropy" in logging_dict:
+                self.tensorboard.add_scalar("info/entropy_avg_sample", logging_dict["current_entropy"], self.total_step)
 
-            self.tensorboard.add_scalar("info/critic_loss_time", value_tuple[0], train_time)
-            self.tensorboard.add_scalar("info/actor_obj_time", -1 * value_tuple[1], train_time)
+            self.tensorboard.add_scalar("info/critic_loss_time", obj_critic_avg, train_time)
+            self.tensorboard.add_scalar("info/actor_obj_time", -1 * obj_actor_avg, train_time)
             self.tensorboard.add_scalar("reward/avg_reward_time", avg_r, train_time)
             self.tensorboard.add_scalar("reward/std_reward_time", std_r, train_time)
             self.tensorboard.add_scalar("reward/exp_reward_time", exp_r, train_time)
@@ -364,7 +370,7 @@ def get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> TEN:
 
 
 def draw_learning_curve(
-    recorder: np.ndarray = None, fig_title: str = "learning_curve", save_path: str = "learning_curve.jpg"
+    recorder: np.ndarray, fig_title: str = "learning_curve", save_path: str = "learning_curve.jpg"
 ):
     steps = recorder[:, 0]  # x-axis is training steps
     r_avg = recorder[:, 1]

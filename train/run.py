@@ -125,12 +125,11 @@ def train_agent_single_process(args: DictConfig):
         exp_r = buffer_items[2].mean().item()  #! on-policy的时候变成了对logprob的mean 需要if
 
         th.set_grad_enabled(True)
-        logging_tuple = agent.update_net(buffer)
-        # logging_tuple = (*logging_tuple, agent.explore_rate, show_str)
-        logging_tuple = (*logging_tuple, show_str)
+        logging_dict = agent.update_net(buffer)
+        logging_dict = {**logging_dict, "show_str": show_str}
         th.set_grad_enabled(False)
 
-        evaluator.evaluate_and_save(actor=agent.act, steps=horizon_len, exp_r=exp_r, logging_tuple=logging_tuple)
+        evaluator.evaluate_and_save(actor=agent.act, steps=horizon_len, exp_r=exp_r, logging_dict=logging_dict)
         if_train = (evaluator.total_step <= break_step) and (not os.path.exists(f"{cwd}/stop"))
 
     print(f"| UsedTime: {time.time() - evaluator.start_time:>7.0f} | SavedDir: {cwd}", flush=True)
@@ -223,8 +222,8 @@ class Learner(Process):
         learner_pipe: tuple[Connection, Connection],
         worker_pipes: List[tuple[Connection, Connection]],
         evaluator_pipe: tuple[Connection, Connection],
-        learners_pipe: Optional[List[tuple[Connection, Connection]]] = None,
-        args: Optional[DictConfig] = None,
+        learners_pipe: Optional[List[tuple[Connection, Connection]]],
+        args: DictConfig,
     ):
         super().__init__()
         self.recv_pipe = learner_pipe[0]
@@ -352,9 +351,25 @@ class Learner(Process):
             else:
                 buffer[:] = buffer_items_tensor
 
+            if if_discrete:
+                # 1. 扁平化 actions 并在 GPU 上转为 long 类型
+                flat_actions = buffer_items_tensor[1].view(-1).long()
+                # 2. 高效统计频次 (GPU)
+                # minlength=action_dim 确保即使某些动作没出现，维度也是固定的
+                counts = th.bincount(flat_actions, minlength=action_dim)
+                # 3. 计算百分比 (归一化到 100)
+                total_samples = flat_actions.numel() + 1e-6
+                # 结果例如: [10, 20, 70] (对应 10%, 20%, 70%)
+                pcts = (counts.float() * 100 / total_samples).long().tolist()
+                # 4. 格式化为带 % 的字符串，并去掉引号使其更像数据
+                # 结果例如: [10%, 20%, 70%]
+                show_str = str([f"{p}%" for p in pcts]).replace("'", "")
+            else:
+                show_str = ""
             """Learner update network using training data"""
             th.set_grad_enabled(True)
-            logging_tuple = agent.update_net(buffer)
+            logging_dict = agent.update_net(buffer)
+            logging_dict = {**logging_dict, "action_show_str": show_str}
             th.set_grad_enabled(False)
 
             if if_off_policy:
@@ -368,7 +383,8 @@ class Learner(Process):
             """Learner receive training signal from Evaluator"""
             if self.eval_pipe.poll():  # whether there is any data available to be read of this pipe0
                 if_train = self.eval_pipe.recv()  # True means evaluator in idle moments.
-                self.eval_pipe.send((actor, accumulated_steps, exp_r, logging_tuple))
+                self.eval_pipe.send((actor, accumulated_steps, exp_r, logging_dict))
+                print(logging_dict)
                 accumulated_steps = 0
             else:
                 # print("| Learner: Evaluator Pipe No Data Poll()", flush=True)  #
@@ -395,7 +411,7 @@ class Worker(Process):
         worker_pipe: tuple[Connection, Connection],
         learner_pipe: tuple[Connection, Connection],
         worker_id: int,
-        args: Optional[DictConfig] = None,
+        args: DictConfig,
     ):
         super().__init__()
         self.recv_pipe = worker_pipe[0]
@@ -467,7 +483,7 @@ class Worker(Process):
 
 
 class EvaluatorProc(Process):
-    def __init__(self, evaluator_pipe: tuple[Connection, Connection], args: Optional[DictConfig] = None):
+    def __init__(self, evaluator_pipe: tuple[Connection, Connection], args: DictConfig):
         super().__init__()
         self.pipe0 = evaluator_pipe[0]
         self.pipe1 = evaluator_pipe[1]
@@ -494,13 +510,13 @@ class EvaluatorProc(Process):
         while if_train:
             # print("| Evaluator: Waiting for Learner", flush=True)
             """Evaluator receive training log from Learner"""
-            actor, steps, exp_r, logging_tuple = self.pipe0.recv()
+            actor, steps, exp_r, logging_dict = self.pipe0.recv()
             """Evaluator evaluate the actor and save the training log"""
             if actor is None:
                 evaluator.total_step += steps  # update total_step but don't update recorder
             else:
                 actor = actor.to(device) if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
-                evaluator.evaluate_and_save(actor, steps, exp_r, logging_tuple)
+                evaluator.evaluate_and_save(actor=actor, steps=steps, exp_r=exp_r, logging_dict=logging_dict)
 
             """Evaluator send the training signal to Learner"""
             if_train = (evaluator.total_step <= break_step) and (not os.path.exists(f"{cwd}/stop"))
