@@ -261,6 +261,7 @@ class Learner(Process):
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
         if_off_policy = args.agent.if_off_policy
+        mode = args.agent.mode
         """Learner init buffer"""
         if if_off_policy:
             buffer = ReplayBuffer(
@@ -292,7 +293,6 @@ class Learner(Process):
         cwd = args.eval.cwd
         del args
         agent.last_state = th.empty((num_seqs, state_dim), dtype=th.float32, device=agent.device)
-
         states = th.zeros((horizon_len, num_seqs, state_dim), dtype=th.float32, device=agent.device)
         actions = (
             th.zeros((horizon_len, num_seqs, action_dim), dtype=th.float32, device=agent.device)
@@ -302,11 +302,19 @@ class Learner(Process):
         rewards = th.zeros((horizon_len, num_seqs), dtype=th.float32, device=agent.device)
         undones = th.zeros((horizon_len, num_seqs), dtype=th.bool, device=agent.device)
         unmasks = th.zeros((horizon_len, num_seqs), dtype=th.bool, device=agent.device)
+
+        buffer_list = [states, actions]
         if if_off_policy:
-            buffer_items_tensor = (states, actions, rewards, undones, unmasks)
+            pass
         else:
             logprobs = th.zeros((horizon_len, num_seqs), dtype=th.float32, device=agent.device)
-            buffer_items_tensor = (states, actions, logprobs, rewards, undones, unmasks)
+            buffer_list.append(logprobs)
+        buffer_list.extend([rewards, undones, unmasks])
+        if mode == "multicase":
+            ids = th.zeros((horizon_len, num_seqs), dtype=th.long, device=agent.device)
+            target_position_vols = th.zeros((horizon_len, num_seqs), dtype=th.float32, device=agent.device)
+            buffer_list.extend([ids, target_position_vols])
+        buffer_items_tensor = tuple(buffer_list)
 
         accumulated_steps = 0
         if_train = True
@@ -435,6 +443,7 @@ class Worker(Process):
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
+        #! 定向config 从这里改起点
         """init agent.last_state"""
         state, info_dict = env.reset()
         if args.env.num_envs == 1:
@@ -469,6 +478,7 @@ class Worker(Process):
                 )  # WindowsNT_OS can only send cpu_tensor
                 # t0 = time.time()  #!
                 """Worker send the training data to Learner"""
+                #! 定向config 这里传入除起点外剩下的case 绝对id来运行
                 buffer_items = agent.explore_env(env, horizon_len)
                 last_state = agent.last_state
                 if os.name == "nt":  # WindowsNT_OS can only send cpu_tensor

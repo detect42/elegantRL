@@ -39,9 +39,8 @@ class FutureExecEnv:
         self.tick2: Optional[pd.DataFrame] = None
         self.action_range = cfg.action_range if self.if_discrete else []
         # reset()
-
-        self.id_index = 0
-        self.idx_index_within = 0
+        self.samples: dict = {}
+        self.absolute_id = 0
         self.id: str = ""
         self.uncompleted = False  # whether the current episode is uncompleted
         # environment information
@@ -73,7 +72,7 @@ class FutureExecEnv:
         self.sample_pool = sample_data[:]
         self.sample_pool_size = len(self.sample_pool)
         eval_data = json.load(open(f"/code/srwang/Finrl/sample_pool/1_eval_data.json", "r"))
-        self.eval_pool = eval_data[:50000]
+        self.eval_pool = eval_data[:50]  #! 调整eval pool case数量大小
         self.eval_pool_size = len(self.eval_pool)
         self.begin_time = 0
         self.end_time = 0
@@ -115,6 +114,7 @@ class FutureExecEnv:
                 sample = self.sample_pool[set_id]
         self.samples = sample
         self.id = sample["id"]
+        self.absolute_id = int(sample["Absolute_ID"])
         self.begin_time = sample["begin_time"]
         self.end_time = sample["end_time"]
 
@@ -448,7 +448,13 @@ class FutureExecEnv:
         assert len(self.history) == self.K
         # print(self.history)
         state_stack = np.concatenate(self.history, axis=0)
-        return state_stack, reward / 1, terminated, truncated, {}
+        return (
+            state_stack,
+            reward / 1,
+            terminated,
+            truncated,
+            {"absolute_id": self.absolute_id, "target_position": self.to_position},
+        )
 
 
 def check_stock_trading_env():

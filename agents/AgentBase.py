@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from typing import Union, Optional
 import random
+from torch.distributions import Distribution
 import torch.nn.functional as F
 from ..train import ReplayBuffer
 from hydra.utils import instantiate
@@ -330,7 +331,7 @@ class ActorBase(nn.Module, ABC):
 
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.ActionDist = th.distributions.normal.Normal
+        self.ActionDist: type[Distribution] = th.distributions.normal.Normal
 
     @abstractmethod
     def get_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]:
