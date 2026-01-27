@@ -305,7 +305,7 @@ class AgentBase:
         for attr_name in self.save_attr_names:
             file_path = f"{cwd}/{attr_name}.pth"
 
-            if getattr(self, attr_name) is None:
+            if getattr(self, attr_name, None) is None:
                 continue
 
             if if_save:

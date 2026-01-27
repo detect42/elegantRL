@@ -478,7 +478,7 @@ class Worker(Process):
                 )  # WindowsNT_OS can only send cpu_tensor
                 # t0 = time.time()  #!
                 """Worker send the training data to Learner"""
-                #! 定向config 这里传入除起点外剩下的case 绝对id来运行
+                #! 定向config 这里传入除起点外剩下的case 绝对id来运行,explore_env最后可添加tasj_config参数
                 buffer_items = agent.explore_env(env, horizon_len)
                 last_state = agent.last_state
                 if os.name == "nt":  # WindowsNT_OS can only send cpu_tensor

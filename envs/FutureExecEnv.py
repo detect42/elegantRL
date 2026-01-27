@@ -72,7 +72,7 @@ class FutureExecEnv:
         self.sample_pool = sample_data[:]
         self.sample_pool_size = len(self.sample_pool)
         eval_data = json.load(open(f"/code/srwang/Finrl/sample_pool/1_eval_data.json", "r"))
-        self.eval_pool = eval_data[:50]  #! 调整eval pool case数量大小
+        self.eval_pool = eval_data[:]  #! 调整eval pool case数量大小
         self.eval_pool_size = len(self.eval_pool)
         self.begin_time = 0
         self.end_time = 0
@@ -355,6 +355,7 @@ class FutureExecEnv:
         cur_ts = self.position.index[i]
         pre_ts = cur_ts - 120
         cur_rate = self.action_range[int(action)] if self.if_discrete else self.convert_action_for_env(action)
+        #cur_rate = 0.08 #! debug
         # if random.random() < 0.00005:
         #    print("action:", cur_rate)
 
