@@ -305,7 +305,7 @@ class AgentReinforce(AgentBase):
         # ======================================================
         # Debug dump 1: adv_pre.csv (rewards, undones, ids, G_rtg, G_flat)
         # ======================================================
-        try:
+        """try:
             os.makedirs("/code/srwang", exist_ok=True)
             r_np = rewards.detach().cpu().numpy().reshape(-1, 1)
             u_np = undones.detach().cpu().numpy().reshape(-1, 1)
@@ -315,7 +315,7 @@ class AgentReinforce(AgentBase):
             stacked = np.hstack([r_np, u_np, ids_np, grtg_np, gflat_np])
             np.savetxt("/code/srwang/adv_pre.csv", stacked, delimiter=",", fmt="%g")
         except Exception as e:
-            print(f"Failed to save adv_pre: {e}")
+            print(f"Failed to save adv_pre: {e}")"""
 
         # ======================================================
         # Step 3: Baseline & Advantage
@@ -358,7 +358,7 @@ class AgentReinforce(AgentBase):
         # ======================================================
         # Debug dump 2: print + adv.csv (Advantages, G_flat, Baselines)
         # ======================================================
-        print(Advantages.mean().item(), Advantages.std().item())
+        """print("Adv info:",Advantages.mean().item(), Advantages.std().item())
         try:
             adv_np = Advantages.detach().cpu().numpy().reshape(-1, 1)
             gflat_np = G_flat.detach().cpu().numpy().reshape(-1, 1)
@@ -367,7 +367,7 @@ class AgentReinforce(AgentBase):
             stacked = np.hstack([adv_np, gflat_np, baselines_np])
             np.savetxt("/code/srwang/adv.csv", stacked, delimiter=",", fmt="%g")
         except Exception as e:
-            print(f"Failed to save adv: {e}")
+            print(f"Failed to save adv: {e}")"""
 
         return Advantages, Weights
 

@@ -71,9 +71,14 @@ class FutureExecEnv:
         self.error_idx = error_idx
         self.sample_pool = sample_data[:]
         self.sample_pool_size = len(self.sample_pool)
-        eval_data = json.load(open(f"/code/srwang/Finrl/sample_pool/1_eval_data.json", "r"))
+        with open(f"/code/srwang/Finrl/sample_pool/1_eval_data.json", "r") as f:
+            eval_data = json.load(f)
+        with open(f"/code/srwang/Finrl/sample_pool/1_test_data.json", "r") as f:
+            test_data = json.load(f)
         self.eval_pool = eval_data[:]  #! 调整eval pool case数量大小
+        self.test_pool = test_data[:]
         self.eval_pool_size = len(self.eval_pool)
+        self.test_pool_size = len(self.test_pool)
         self.begin_time = 0
         self.end_time = 0
         self.cum_reward: float = 0.0
@@ -104,12 +109,17 @@ class FutureExecEnv:
 
                 return sample
 
-    def reset(self, set_id: int = -1, sequential=False, eval_mode=False) -> Tuple[ARY, dict]:
+    def reset(self, set_id: int = -1, sequential: bool = False, mode: str = "sample") -> Tuple[ARY, dict]:
+        if mode not in {"sample", "eval", "test"}:
+            raise ValueError(f"Unknown reset mode: {mode}")
+
         if set_id == -1:
             sample = self.sample(sequential)
         else:
-            if eval_mode:
+            if mode == "eval":
                 sample = self.eval_pool[set_id]
+            elif mode == "test":
+                sample = self.test_pool[set_id]
             else:
                 sample = self.sample_pool[set_id]
         self.samples = sample
@@ -311,13 +321,13 @@ class FutureExecEnv:
         state_dict["now_slippage_bp"] = (self.cum_slippage) / (self.cum_turnover + 1) * 10000  # 当前滑点，单位为基点
 
         state_dict_trans = self.trans_dict(state_dict)
-        # print(state_dict_trans)  # pr
+        # print(state_dict_trans)  # prif action_arr.size == 1 else int(action_arr.argmax())
         # 拼接到 State 后面
         # print(state_dict)
         State = np.array(list(state_dict_trans.values()), dtype=np.float32)
         # print(State)
         # time.sleep(1)
-        if random.random() < 0.0000002:
+        if random.random() < 0.00000004:
             print("state", State.shape, [f"{x:.3f}" for x in State])
 
         # print(State.shape, "State shape")

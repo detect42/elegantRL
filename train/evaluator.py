@@ -1,6 +1,7 @@
 import os
 import time
-from typing import List, Tuple,Dict
+from typing import List, Tuple, Dict
+from typing import Callable, Union, Any
 import time
 import numpy as np
 import torch as th
@@ -10,7 +11,7 @@ from threadpoolctl import threadpool_limits
 TEN = th.Tensor
 
 
-def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
+def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu", mode: str = "eval"):
     """
     运行在子进程中的评测逻辑
     """
@@ -21,6 +22,11 @@ def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
         actor_cpu.eval()
 
         results = []
+        action_counts = None
+        if env.if_discrete:
+            action_dim = int(env.action_dim)
+            if action_dim > 0:
+                action_counts = np.zeros(action_dim, dtype=np.int64)
 
         # 为了避免每次 step 都创建 tensor 的开销，预先定义好 device
         device = th.device(device_type)
@@ -30,7 +36,7 @@ def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
                 # print(set_id)
                 # === 核心修改：传入 seq 参数 ===
                 # 假设您的 env.reset 支持 seq 参数
-                state, _ = env.reset(set_id=set_id, eval_mode=True)
+                state, _ = env.reset(set_id=set_id, mode=mode)
                 cumulative_returns = 0.0
                 episode_steps = 0
 
@@ -42,7 +48,14 @@ def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
                     tensor_action = actor_cpu(tensor_state)
                     action = tensor_action.detach().numpy()[0]  # 已经是 CPU 了
 
+                    if action_counts is not None:
+                        action_arr = np.asarray(action)
+                        action_idx = int(action_arr.item())
+                        if 0 <= action_idx < action_counts.shape[0]:
+                            action_counts[action_idx] += 1
+
                     # 环境交互
+                    #print(action)
                     state, reward, terminated, truncated, _ = env.step(action)
                     cumulative_returns += reward
                     episode_steps += 1
@@ -53,7 +66,7 @@ def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu"):
                 # 记录结果 (reward, step)
                 results.append((cumulative_returns, episode_steps))
 
-    return results
+    return results, action_counts
 
 
 class Evaluator:
@@ -73,7 +86,7 @@ class Evaluator:
         self.if_over_write = args.eval.if_over_write
 
         self.recorder_path = f"{cwd}/recorder.npy"
-        self.recorder = []  # total_step, r_avg, r_std, critic_value, ...
+        self.recorder: List = []  # total_step, r_avg, r_std, critic_value, ...
         self.recorder_step = args.eval.record_step  # start recording after the exploration reaches this step.
         self.max_r = -np.inf
         print(
@@ -92,6 +105,11 @@ class Evaluator:
             flush=True,
         )
         assert type(env.num_envs) == int and env.num_envs >= 1
+        # Allow get_cumulative_rewards_and_step to return either Tensor or Tuple[Tensor, Tensor]
+
+        self.get_cumulative_rewards_and_step: Callable[[Any], Union[th.Tensor, Tuple[th.Tensor, th.Tensor]]]
+        self.tensorboard: Union[Any, None] = None
+
         if args.eval.eval_dataset_test_all:
             self.get_cumulative_rewards_and_step = self.get_cumulative_rewards_and_step_single_env_parallel
         elif env.num_envs == 1:  # get attribute
@@ -107,7 +125,7 @@ class Evaluator:
         else:
             self.tensorboard = None
 
-    def evaluate_and_save(self, actor: th.nn.Module, steps: int, exp_r: float, logging_dict: Dict[str,float]):
+    def evaluate_and_save(self, actor: th.nn.Module, steps: int, exp_r: float, logging_dict: Dict[str, float]):
         # print("now_steps=",self.total_step,"eval_step_counter= ",self.eval_step_counter," target_steps:",self.eval_step_counter + self.eval_per_step, " add steps->",steps," exp_r->",exp_r,flush=True)
 
         self.total_step += steps  # update total training steps
@@ -117,14 +135,41 @@ class Evaluator:
         if self.total_step < self.eval_step_counter + self.eval_per_step:
             return
         self.eval_step_counter = self.total_step
-        rewards_step_ten = self.get_cumulative_rewards_and_step(actor)
-        print(rewards_step_ten.shape, flush=True)  # p
-        eval_returns = rewards_step_ten[:, 0]  # episodic cumulative returns of an
-        eval_steps = rewards_step_ten[:, 1]  # episodic step number
+        rewards_step_result = self.get_cumulative_rewards_and_step(actor)
+        eval_action_pct = None
+        test_action_pct = None
+        if isinstance(rewards_step_result, (tuple, list)) and len(rewards_step_result) == 4:
+            rewards_step_ten_eval, rewards_step_ten_test, eval_action_pct, test_action_pct = rewards_step_result
+        elif isinstance(rewards_step_result, (tuple, list)) and len(rewards_step_result) == 3:
+            rewards_step_ten_eval, rewards_step_ten_test, eval_action_pct = rewards_step_result
+        elif isinstance(rewards_step_result, (tuple, list)) and len(rewards_step_result) == 2:
+            rewards_step_ten_eval, rewards_step_ten_test = rewards_step_result
+        else:
+            rewards_step_ten_eval = rewards_step_result
+            rewards_step_ten_test = None
+
+        #print("eval_pool:", rewards_step_ten_eval.shape, flush=True)  # p
+        #if rewards_step_ten_test is not None:
+        #    print("test_pool:", rewards_step_ten_test.shape, flush=True)  # print
+        eval_returns = rewards_step_ten_eval[:, 0]  # episodic cumulative returns of an
+        eval_steps = rewards_step_ten_eval[:, 1]  # episodic step number
         avg_r = eval_returns.mean().item()
         std_r = eval_returns.std().item()
         avg_s = eval_steps.mean().item()
         std_s = eval_steps.std().item()
+
+        avg_r_test: Union[float, None] = None
+        std_r_test: Union[float, None] = None
+        avg_s_test: Union[float, None] = None
+        std_s_test: Union[float, None] = None
+        if rewards_step_ten_test is not None:
+            test_returns = rewards_step_ten_test[:, 0]
+            test_steps = rewards_step_ten_test[:, 1]
+            avg_r_test = test_returns.mean().item()
+            std_r_test = test_returns.std().item()
+            avg_s_test = test_steps.mean().item()
+            std_s_test = test_steps.std().item()
+
         train_time = int(time.time() - self.start_time)
         obj_critic_avg = logging_dict["obj_critic_avg"]
         obj_actor_avg = logging_dict["obj_actor_avg"]
@@ -136,29 +181,49 @@ class Evaluator:
         if self.tensorboard:
             self.tensorboard.add_scalar("info/critic_loss_sample", obj_critic_avg, self.total_step)
             self.tensorboard.add_scalar("info/actor_obj_sample", -1 * obj_actor_avg, self.total_step)
-            self.tensorboard.add_scalar("reward/avg_reward_sample", avg_r, self.total_step)
-            self.tensorboard.add_scalar("reward/std_reward_sample", std_r, self.total_step)
-            self.tensorboard.add_scalar("reward/exp_reward_sample", exp_r, self.total_step)
-            self.tensorboard.add_scalar("step/avg_step", avg_s, self.total_step)
-            self.tensorboard.add_scalar("step/std_step", std_s, self.total_step)
             if "obj_entropy_avg" in logging_dict:
                 self.tensorboard.add_scalar("info/entropy_avg_sample", logging_dict["obj_entropy_avg"], self.total_step)
             if "current_entropy" in logging_dict:
                 self.tensorboard.add_scalar("info/entropy_avg_sample", logging_dict["current_entropy"], self.total_step)
+            self.tensorboard.add_scalar("info/exp_reward_sample", exp_r, self.total_step)
+            # self.tensorboard.add_scalar("info/critic_loss_time", obj_critic_avg, train_time)
+            # self.tensorboard.add_scalar("info/actor_obj_time", -1 * obj_actor_avg, train_time)
 
-            self.tensorboard.add_scalar("info/critic_loss_time", obj_critic_avg, train_time)
-            self.tensorboard.add_scalar("info/actor_obj_time", -1 * obj_actor_avg, train_time)
-            self.tensorboard.add_scalar("reward/avg_reward_time", avg_r, train_time)
-            self.tensorboard.add_scalar("reward/std_reward_time", std_r, train_time)
-            self.tensorboard.add_scalar("reward/exp_reward_time", exp_r, train_time)
+            # 分级保存 eval / test
+            self.tensorboard.add_scalar("eval_set/avg_reward_sample", avg_r, self.total_step)
+            self.tensorboard.add_scalar("eval_set/std_reward_sample", std_r, self.total_step)
+            self.tensorboard.add_scalar("eval_set/avg_step", avg_s, self.total_step)
+            self.tensorboard.add_scalar("eval_set/std_step", std_s, self.total_step)
+            # self.tensorboard.add_scalar("reward/eval/avg_reward_time", avg_r, train_time)
+            # self.tensorboard.add_scalar("reward/eval/std_reward_time", std_r, train_time)
+            # self.tensorboard.add_scalar("reward/eval/exp_reward_time", exp_r, train_time)
+
+            if avg_r_test is not None:
+                self.tensorboard.add_scalar("test_set/avg_reward_sample", avg_r_test, self.total_step)
+                self.tensorboard.add_scalar("test_set/std_reward_sample", std_r_test, self.total_step)
+                self.tensorboard.add_scalar("test_set/avg_step", avg_s_test, self.total_step)
+                self.tensorboard.add_scalar("test_set/std_step", std_s_test, self.total_step)
+                # self.tensorboard.add_scalar("reward/test/avg_reward_time", avg_r_test, train_time)
+                # self.tensorboard.add_scalar("reward/test/std_reward_time", std_r_test, train_time)
+                # self.tensorboard.add_scalar("reward/test/exp_reward_time", exp_r_test, train_time)
 
         """print some information to Terminal"""
         prev_max_r = self.max_r
         self.max_r = max(self.max_r, avg_r)  # update max average cumulative rewards
+        eval_action_pct_str = ""
+        test_action_pct_str = ""
+        if eval_action_pct is not None:
+            eval_action_pct_str = " eval_action_pct=[" + ", ".join(f"{p:.2f}%" for p in eval_action_pct) + "]"
+        if test_action_pct is not None:
+            test_action_pct_str += " test_action_pct=[" + ", ".join(f"{p:.2f}%" for p in test_action_pct) + "]"
+
         print(
             f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} |"
             f"{avg_r:8.2f}{std_r:7.1f}{avg_s:7.0f}{std_s:6.0f} |"
-            f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in value_tuple)} {logging_str}",
+            f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in value_tuple)} {logging_str}|",
+            f"{avg_r_test:8.2f}{std_r_test:7.1f}{avg_s_test:7.0f}{std_s_test:6.0f}" if avg_r_test is not None else "",
+            "\n",
+            eval_action_pct_str + test_action_pct_str,
             flush=True,
         )
 
@@ -197,22 +262,24 @@ class Evaluator:
             self.total_step = self.recorder[-1][0]
 
     def get_cumulative_rewards_and_step_single_env(self, actor) -> TEN:
-        rewards_steps_list = [get_rewards_and_steps(self.env, actor) for _ in range(self.eval_times)]
-        rewards_steps_ten = th.tensor(rewards_steps_list, dtype=th.float32)
-        return rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
+        rewards_steps_list = [Get_rewards_and_steps(self.env, actor) for _ in range(self.eval_times)]
+        rewards_steps_eval = th.tensor(rewards_steps_list, dtype=th.float32)
+        return rewards_steps_eval  # rewards_steps_eval.shape[1] == 2
 
     def get_cumulative_rewards_and_step_vectorized_env(self, actor) -> TEN:
         rewards_step_list = [
-            get_cumulative_rewards_and_step_from_vec_env(self.env, actor)
+            Get_cumulative_rewards_and_step_from_vec_env(self.env, actor)
             for _ in range(max(1, self.eval_times // self.env.num_envs))
         ]
         rewards_step_list = sum(rewards_step_list, [])
-        rewards_step_ten = th.tensor(rewards_step_list)
-        return rewards_step_ten  # rewards_steps_ten.shape[1] == 2
+        rewards_step_eval = th.tensor(rewards_step_list)
+        return rewards_step_eval  # rewards_steps_ten.shape[1] == 2
 
-    def get_cumulative_rewards_and_step_single_env_parallel(self, actor) -> TEN:
-        rewards_steps_ten = get_cumulative_rewards_and_step_single_env_parallel(self.env, actor)
-        return rewards_steps_ten  # rewards_steps_ten.shape[1] == 2
+    def get_cumulative_rewards_and_step_single_env_parallel(
+        self, actor
+    ) -> Tuple[TEN, TEN, Union[List[float], None], Union[List[float], None]]:
+        rewards_step_eval_test = Get_cumulative_rewards_and_step_single_env_parallel(self.env, actor)
+        return rewards_step_eval_test  # rewards_steps_ten.shape[1] == 2
 
     def save_training_curve_jpg(self):
         recorder = np.array(self.recorder)
@@ -228,7 +295,7 @@ class Evaluator:
 """util"""
 
 
-def get_rewards_and_steps(env, actor, if_render: bool = False) -> Tuple[float, int]:
+def Get_rewards_and_steps(env, actor, if_render: bool = False) -> Tuple[float, int]:
     """Usage
     eval_times = 4
     net_dim = 2 ** 7
@@ -268,7 +335,7 @@ def get_rewards_and_steps(env, actor, if_render: bool = False) -> Tuple[float, i
     return cumulative_returns, episode_steps + 1
 
 
-def get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float, int]]:
+def Get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float, int]]:
     device = env.device
     env_num = env.num_envs
     max_step = env.max_step
@@ -309,7 +376,7 @@ def get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float
     return returns_step_list
 
 
-def get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> TEN:
+def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN, TEN]:
     import multiprocessing
     from copy import deepcopy
 
@@ -317,14 +384,6 @@ def get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> TEN:
 
     # 1. 准备配置
     num_workers = env.eval_num_workers
-    total_times = env.eval_pool_size  # 总评测次数 (例如 14w)
-    #total_times = 1000
-    # 2. 生成所有任务 ID (假设 ID 是从 0 到 total_times-1)
-    all_ids = np.arange(total_times)
-
-    # 3. 将任务 ID 切分为 chunks 分发给 Worker
-    # np.array_split 会自动处理不能整除的情况
-    chunks = np.array_split(all_ids, num_workers)
 
     # 4. 准备 Actor (必须转到 CPU !)
     # GPU 模型在多进程 Fork/Spawn 时极易出错且效率低 (Batch=1时)
@@ -336,42 +395,57 @@ def get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> TEN:
     # 这里直接传 self.env 会报错。
     # 如果报错，您需要改为传递 env_class 和 env_args 在子进程内重建环境。
     # 这里假设您的 env 是可以 pickle 的。
-    env_copy = deepcopy(env)
+    def _run_mode(mode: str, total_times: int) -> Tuple[TEN, Union[List[float], None]]:
+        # 2. 生成所有任务 ID (假设 ID 是从 0 到 total_times-1)
+        all_ids = np.arange(total_times)
+
+        # 3. 将任务 ID 切分为 chunks 分发给 Worker
+        chunks = np.array_split(all_ids, num_workers)
+
+        # 5. 准备 Environment (独立拷贝，避免状态干扰)
+        env_copy = deepcopy(env)
+
+        # 6. 组装参数
+        worker_args = [(actor_cpu, env_copy, chunk, env.max_step, "cpu", mode) for chunk in chunks]
+
+        # 7. 启动并行池
+        try:
+            ctx = multiprocessing.get_context("fork")
+        except:
+            ctx = multiprocessing.get_context("spawn")
+
+        with ctx.Pool(processes=num_workers) as pool:
+            results_nested = pool.starmap(_eval_worker, worker_args)
+
+        flat_results = []
+        action_counts_total = None
+        for sub_results, sub_counts in results_nested:
+            flat_results.extend(sub_results)
+            if sub_counts is not None:
+                if action_counts_total is None:
+                    action_counts_total = np.asarray(sub_counts, dtype=np.int64)
+                else:
+                    action_counts_total += np.asarray(sub_counts, dtype=np.int64)
+
+        action_pct = None
+        if action_counts_total is not None:
+            total = int(action_counts_total.sum())
+            if total > 0:
+                action_pct = (action_counts_total / total * 100.0).tolist()
+
+        return th.tensor(flat_results, dtype=th.float32), action_pct
+
     t0 = time.time()
-    # 6. 组装参数
-    # (actor, env, ids, max_step, device)
-    worker_args = [(actor_cpu, env_copy, chunk, env.max_step, "cpu") for chunk in chunks]
-
-    # 7. 启动并行池
-    # 使用 'spawn' 模式通常比 'fork' 更安全，特别是涉及 PyTorch 时
-    # 但 'fork' 在 Linux 上启动更快。如果遇到死锁，请改用 get_context('spawn')
-    try:
-        ctx = multiprocessing.get_context("fork")  # Linux 推荐尝试 fork，不行再 spawn
-    except:
-        ctx = multiprocessing.get_context("spawn")  # Windows 或 fallback
-
-    with ctx.Pool(processes=num_workers) as pool:
-        # starmap 会自动解包参数传给 _eval_worker
-        results_nested = pool.starmap(_eval_worker, worker_args)
-
-    # 8. 结果合并
-    # results_nested 是 [[(r,s), (r,s)...], [(r,s)...]] 的结构
-    flat_results = [item for sublist in results_nested for item in sublist]
-
-    # 9. 转换为 Tensor 返回
-    # 形状应该是 (total_times, 2)
-    rewards_steps_ten = th.tensor(flat_results, dtype=th.float32)
-
+    rewards_steps_ten_eval, eval_action_pct = _run_mode("eval", env.eval_pool_size)
+    rewards_steps_ten_test, test_action_pct = _run_mode("test", env.test_pool_size)
     t1 = time.time()
     total_time = t1 - t0
-    print(f"| Eval Time Cost: {total_time:.2f} seconds", flush=True)
+    print(f"| Eval+Test Time Cost: {total_time:.2f} seconds", flush=True)
 
-    return rewards_steps_ten
+    return rewards_steps_ten_eval, rewards_steps_ten_test, eval_action_pct, test_action_pct
 
 
-def draw_learning_curve(
-    recorder: np.ndarray, fig_title: str = "learning_curve", save_path: str = "learning_curve.jpg"
-):
+def draw_learning_curve(recorder: np.ndarray, fig_title: str = "learning_curve", save_path: str = "learning_curve.jpg"):
     steps = recorder[:, 0]  # x-axis is training steps
     r_avg = recorder[:, 1]
     r_std = recorder[:, 2]

@@ -11,7 +11,7 @@ import numpy.random as rd
 from .config import build_env
 from .replay_buffer import ReplayBuffer
 from .evaluator import Evaluator
-from .evaluator import get_rewards_and_steps
+from .evaluator import Get_rewards_and_steps
 from omegaconf import DictConfig, OmegaConf
 from hydra.utils import instantiate, get_class
 
@@ -566,7 +566,7 @@ def valid_agent(
     print(f"| render and load actor from: {actor_path}", flush=True)
     actor.load_state_dict(th.load(actor_path, map_location=lambda storage, loc: storage))
     for i in range(render_times):
-        cumulative_reward, episode_step = get_rewards_and_steps(env, actor, if_render=True)
+        cumulative_reward, episode_step = Get_rewards_and_steps(env, actor, if_render=True)
         print(f"|{i:4}  cumulative_reward {cumulative_reward:9.3f}  episode_step {episode_step:5.0f}", flush=True)
 
 
@@ -584,5 +584,5 @@ def render_agent(
     print(f"| render and load actor from: {actor_path}", flush=True)
     actor.load_state_dict(th.load(actor_path, map_location=lambda storage, loc: storage))
     for i in range(render_times):
-        cumulative_reward, episode_step = get_rewards_and_steps(env, actor, if_render=True)
+        cumulative_reward, episode_step = Get_rewards_and_steps(env, actor, if_render=True)
         print(f"|{i:4}  cumulative_reward {cumulative_reward:9.3f}  episode_step {episode_step:5.0f}", flush=True)
