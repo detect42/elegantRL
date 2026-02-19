@@ -1,0 +1,103 @@
+# conf/config.yaml
+defaults:
+  - _self_
+  - agent: reinforce
+desc: "reinforce_agent"
+
+# ==============================================================================
+# 1. 环境参数 (Environment)
+# ==============================================================================
+env: &env_config
+  env_name: "FutureExecEnv"                  # 环境名称
+  _target_: elegantrl.envs.FutureExecEnv.FutureExecEnv  # 指向环境类的完整路径
+  action_range: [0.00,0.02,0.04,0.06, 0.08]              # 离散动作选择
+  num_envs: 1                            # 向量化子环境数量 (1为单环境, >1为向量化环境)
+  max_step: 99999                        # 每个 Episode 的最大步数
+  state_dim: 10                        #? 状态维度 (Python 代码中会根据 K 计算)
+  action_dim: 5                          # 动作维度
+  if_discrete: true                      #! 是否为离散动作空间
+  eval_num_workers: 16                   # 评估时的并行环境数量
+  gpu_id: null
+
+  # --- 自定义环境参数 ---
+  if_build_vec_env: false                # 是否强制构建 VecEnv
+  K: 1                                  # 历史数据窗口长度
+  padding0: false                        # 是否进行 0 填充
+
+# ==============================================================================
+# 2. Agent
+# ==============================================================================
+# agent目录里调用yaml文件
+
+# ==============================================================================
+# 3. 训练参数 (Training)
+# ==============================================================================
+train:
+  # --- 奖励与优化 ---
+  gamma: 1.00                           # 折扣因子 (Discount Factor)
+  reward_scale: 1.0                      # 奖励缩放比例 (通常为了稳定数值范围)
+  clip_grad_norm: 3.0                    # 梯度裁剪阈值
+  L2_reg: 0.0                            # L2 正则化系数
+
+  # --- 更新策略 ---
+  state_value_tau: 0.0                   # 状态归一化系数 (0 表示不使用)
+  soft_update_tau: 0.005                 # 目标网络软更新系数 (Soft Update Tau)
+  continue_train: false                  # 是否加载已有模型继续训练
+
+  # --- Batch & Buffer (默认填写的 Off-policy 值) ---
+  kk: 1                                   # scale factor
+  batch_size: 65536                     #! 批大小65536
+  horizon_len: 65536                      #! 采样步数 (On-polic需要更多)
+  buffer_size: 200000                  #! 经验回放池大小 (On-policy 设为 0)
+  repeat_times: 2.0                      #! 每次采样后的更新次数 (On-policy 通常为 8.0)
+  buffer_init_size: 20000                 # 训练前预采样的随机数据量 (Off-policy 专用)
+
+  # --- 算法特定 ---
+  if_use_per: false                      # 是否使用优先经验回放 (PER)
+  lambda_fit_cum_r: 0.0                  # Critic 拟合累积回报的系数
+
+  # --- 终止条件 ---
+  break_step: 1000000000000                 # 总训练步数上限
+  break_score: 1000000000                # 累积奖励上限
+
+# ==============================================================================
+# 4. 评估与保存 (Evaluate)
+# ==============================================================================
+eval:
+  cwd: null                              # 模型保存路径 (由 Hydra 自动管理，代码回填)
+  if_remove: true                        # 是否删除旧的 cwd 目录
+  if_keep_save: true                     # 是否保留所有的 Checkpoint (False 则只存最新的)
+  if_over_write: false                   # 是否覆盖最优策略网络 (actor.pth)
+  if_save_buffer: false                  # 训练结束后是否保存 Replay Buffer 数据
+
+  eval_dataset_test_all: true
+  save_gap: 1                            # 记录学习曲线的间隔 (Save actor_*.pth)
+  times: 1                               # 每次评估计算平均回报的次数 (eval_times)
+  per_step: 500000                        # 每训练多少步执行一次评估 (eval_per_step)
+  record_step: 0                         # 在多少步之后开始记录评估数据 (eval_record_step)
+  env:
+    <<: *env_config                        # 评估专用环境参数 (默认为 None)
+    #num_envs: 16
+    #if_build_vec_env: true
+    #max_step: 100000
+
+# =======================================================================
+# 5. 系统参数 (System)
+# ==============================================================================
+sys:
+  gpu_id: 0                              # 主 GPU ID (-1 为 CPU)
+  num_workers: 24                         # 采样 Worker 进程数量
+  num_threads: 8                         # PyTorch CPU 线程数
+  random_seed: null                      # 随机种子 (Null 则默认使用 GPU ID)
+  learner_gpu_ids: []                    # Learner 多 GPU 训练的 ID 列表
+
+# ==============================================================================
+# 6. Hydra 内部配置
+# ==============================================================================
+hydra:
+  run:
+    # 日志目录格式: log/日期-时间_描述
+    dir: /code/srwang/Finrl/log/${now:%Y%m%d-%H%M%S}_${desc}
+  job:
+    chdir: false
+  output_subdir: hydra_config            # 配置文件存放的子目录名称

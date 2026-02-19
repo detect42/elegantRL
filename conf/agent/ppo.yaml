@@ -1,0 +1,29 @@
+# conf/model/ppo.yaml
+
+agent_name: "AgentPPO"
+if_off_policy: false
+
+ratio_clip: 0.25
+lambda_gae_adv: 0.95
+lambda_entropy: 0.001
+if_use_v_trace: true # on-policy 专用
+actor_learning_rate: 1e-04
+critic_learning_rate: 1e-04
+
+
+criterion:
+    _target_: torch.nn.MSELoss           # 目标类的完整路径
+    reduction: "none"
+
+# 1. Actor 配置
+actor:
+  type: "mlp"
+  mlp_args:
+    net_dims: [128, 256, 128, 32]
+    use_ln: false
+
+# 2. Critic 配置
+critic:
+  type: "mlp"
+  mlp_args:
+    net_dims: [128,256, 128, 32]
