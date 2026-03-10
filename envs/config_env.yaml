@@ -1,0 +1,17 @@
+env:
+  env_name: "FutureExecEnv"                  # 环境名称
+  _target_: elegantrl.envs.FutureExecEnv.FutureExecEnv  # 指向环境类的完整路径
+  action_range: [0.00,0.02,0.04,0.06, 0.08]              # 离散动作选择
+  #action_range: [0.00,0.015,0.03,0.045, 0.06]              # 离散动作选择
+  num_envs: 1                            # 向量化子环境数量 (1为单环境, >1为向量化环境)
+  max_step: 99999                        # 每个 Episode 的最大步数
+  state_dim: 10                        #? 状态维度 (Python 代码中会根据 K 计算)
+  action_dim: 5                          # 动作维度
+  if_discrete: true                      #! 是否为离散动作空间
+  eval_num_workers: 24                   # 评估时的并行环境数量
+  gpu_id: 0
+
+  # --- 自定义环境参数 ---
+  if_build_vec_env: false                # 是否强制构建 VecEnv
+  K: 1                                  # 历史数据窗口长度
+  padding0: false                        # 是否进行 0 填充

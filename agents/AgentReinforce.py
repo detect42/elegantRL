@@ -35,7 +35,6 @@ class AgentReinforce(AgentBase):
         # 4. 训练超参
         self.ratio_clip = args.agent.ratio_clip
         self.lambda_entropy = args.agent.lambda_entropy
-        self.repeat_times = args.agent.repeat_times
 
         self.valid_count: int = 0
 
@@ -385,6 +384,7 @@ class ActorDiscreteReinforce(ActorBase):
         self.ActionDist: type[th.distributions.Categorical] = th.distributions.Categorical
         self.greedy_eps: float = cfg.greedy_eps
         self.temp_tau: float = cfg.temp_tau
+        #! self.K = cfg.需要K和padding0
 
     def _probs(self, state: TEN, temperature: Optional[float] = None) -> TEN:
         logits = self.net(state)

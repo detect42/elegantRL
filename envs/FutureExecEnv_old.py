@@ -23,46 +23,6 @@ class FutureExecEnv:
         self,
         cfg: DictConfig,
     ):
-        # 定义严格的特征顺序（总共 31 个特征）
-        self.STATE_FEATURES = [
-            # Market
-            "vwap_5s_over_60s",
-            "vwap_30s_over_300s",
-            "vwap_rank_12x5s",
-            "vwap_rank_12x30s",
-            "cur_price/base_price",
-            "pv_corr_24x5s",
-            "shadow_vwap_dev",
-            "fragility_24x5s_norm",
-            "KER_24x5s",
-            "Rejection_Bias_12x5s",
-            "Vol_Squeeze",
-            "Flow_Toxicity_12x5s",
-            # Factor
-            "signal_5s",
-            "signal_1m",
-            "signal_1h",
-            # Volatility
-            "vol_feat_300s",
-            "pressure_12x5s",
-            "smart_momentum_60x5s",
-            "Gini_300s",
-            "vol_shock",
-            "log_position",
-            # Process
-            "pos_ratio",
-            "participate_rate",
-            "market_ratio",
-            "gap_to_market",
-            # Slippage
-            "exp_slippage_bp",
-            "now_slippage_bp",
-            # Event
-            "event_open_rush",
-            "event_close_rush",
-            "event_vol_breakout",
-            "event_sig_spike",
-        ]
         self.num_envs = cfg.num_envs
         self.K: int = cfg.K
         self.state_dim: int = cfg.state_dim
@@ -74,10 +34,11 @@ class FutureExecEnv:
         self.device = th.device("cpu") if cfg.gpu_id == -1 else th.device(f"cuda:{cfg.gpu_id}")
         self.tot_uncompleted = 0
         self.dataset = "1_sample"
-        self.position_root = "/nas/srwang/DATA_preprocess/1_sample_feature_7"
+        self.position_root = "/nas/srwang/ExecRL_DATA/1_sample_signals_norm"
+        self.scored_tick2_root = "/nas/srwang/ExecRL_DATA/1_sample_signals_norm"
         self.position: pd.DataFrame
+        self.tick2: pd.DataFrame
         self.action_range = cfg.action_range if self.if_discrete else []
-        self.rate_upper_bound: float = max(self.action_range) if self.if_discrete else 0.08
         # reset()
         self.samples: dict = {}
         self.absolute_id = 0
@@ -96,17 +57,15 @@ class FutureExecEnv:
         self.time_idx: int = 0
         self.contract_multiplier: int = 1
         self.total_time: int = 0
-
-        self.total_cum_volume: float = 0.0
-        self.total_cum_turnover: float = 0.0
-        self.my_cum_turnover: float = 0.0
-        self.my_cum_slippage: float = 0.0
+        self.cum_volume: float = 0.0
+        self.cum_turnover: float = 0.0
+        self.cum_slippage: float = 0.0
         self.total_turnover: float = 0.0
-        self.total_volume: float = 0.0
         self.base_price: float = 0.0
         self.history: list = []
 
         # 加载 json 数据
+        print(f"/code/srwang/Finrl/sample_pool/1_train_data.json")
         with open(f"/code/srwang/Finrl/sample_pool/1_train_data.json", "r") as f:
             sample_data = json.load(f)
         print("sample data len= ", len(sample_data))
@@ -168,40 +127,44 @@ class FutureExecEnv:
                 raise ValueError(f"Unknown mode: {mode}")
         self.samples = sample
         self.id = sample["id"]
+        print(self.id, "case id")
         self.absolute_id = int(sample["Absolute_ID"])
         self.begin_time = sample["begin_time"]
         self.end_time = sample["end_time"]
 
         self.realized_position = 0
+        self.cum_volume = 0.0
+        self.cum_turnover = 0.0
+        self.cum_slippage = 0.0
+        self.total_turnover = 0.0
         self.from_position = 0
         self.to_position = sample["target_position"]
         self.total_time = self.end_time - self.begin_time
-
         self.uncompleted = False
         self.cum_reward = 0.0
         assert self.state_dim % self.K == 0, f"state_dim={self.state_dim} must be divisible by K={self.K}"
         self.history.clear()
-        assert self.from_position != self.to_position, "from_position should not equal to to_position at reset."
-        self.side = np.sign(self.to_position - self.from_position)
+        # 构造 position DataFrame
+        times = np.arange(self.begin_time, self.end_time + 1, self.freq)  #! 注意data里面 结尾没有按照5s对齐
+        self.position = pd.DataFrame({"version_ts": times, "position": self.to_position}, index=times)
 
-        self.position = pd.read_pickle(os.path.join(self.position_root, f"position_{self.id}.pkl"))
-        self.position = self.position[
-            (self.position["version_ts"] >= self.begin_time) & (self.position["version_ts"] <= self.end_time)
-        ].copy()
-        self.position.set_index("version_ts", inplace=True)
+        self.tick2 = pd.read_pickle(os.path.join(self.scored_tick2_root, f"tick2_{self.id}.pkl"))
+        self.tick2["version_ts"] = self.tick2.index
+        self.tick2 = self.tick2[
+            (self.tick2["version_ts"] >= self.begin_time) & (self.tick2["version_ts"] <= self.end_time)
+        ]
         self.process()
-        self.time_idx = 0
-        self.time_curr = self.position.index[self.time_idx]
         self.base_price = self.position.iloc[0]["mid_price"]
-
-        self.total_cum_volume = 0.0
-        self.total_cum_turnover = 0.0
-        self.my_cum_turnover = 0.0
-        self.my_cum_slippage = 0.0
         self.total_turnover = self.base_price * np.abs(
             self.to_position
         )  #! 之前没加abs,导致在negative情况下全是负的total_turnover
-        self.total_volume = self.to_position
+        assert self.from_position != self.to_position, "from_position should not equal to to_position at reset."
+        self.side = np.sign(self.to_position - self.from_position)
+        # print(self.from_position, "-->",self.to_position, self.side)
+        self.time_idx = 0
+        self.time_curr = self.position.index[self.time_idx]
+        # print(self.tick2)
+        # print(self.position)
 
         new_state = self.get_state()
         self.history.append(new_state)
@@ -225,18 +188,43 @@ class FutureExecEnv:
 
     def process(self):
 
-        valid_mask = (0.8 * self.position["mid_price"] <= self.position["vwap_5s"]) & (
-            self.position["vwap_5s"] <= 1.2 * self.position["mid_price"]
+        assert not ((self.tick2["ask_price1"] <= 0) & (self.tick2["bid_price1"] <= 0)).any()
+        self.tick2["mid_price"] = (self.tick2["ask_price1"] + self.tick2["bid_price1"]) / 2
+        self.tick2.loc[self.tick2["ask_price1"] <= 0, "mid_price"] = self.tick2.loc[
+            self.tick2["ask_price1"] <= 0, "bid_price1"
+        ]
+        self.tick2.loc[self.tick2["bid_price1"] <= 0, "mid_price"] = self.tick2.loc[
+            self.tick2["bid_price1"] <= 0, "ask_price1"
+        ]
+
+        idxs = np.searchsorted(self.tick2["version_ts"].values, self.position["version_ts"].values)
+        idxs = np.clip(idxs, 0, len(self.tick2) - 1)
+        self.position["mid_price"] = self.tick2.iloc[idxs]["mid_price"].values
+        self.position["volume"] = self.tick2.iloc[idxs]["volume"].values
+        self.position["turnover"] = self.tick2.iloc[idxs]["turnover"].values
+        self.position["volume"] = self.position["volume"].diff().fillna(0.0)
+        self.position["turnover"] = self.position["turnover"].diff().fillna(0.0)
+        self.position["vwap"] = self.position["turnover"] / self.position["volume"] / self.contract_multiplier
+        self.position["last_price"] = self.tick2.iloc[idxs]["last_price"].values
+        valid_mask = (0.8 * self.position["mid_price"] <= self.position["vwap"]) & (
+            self.position["vwap"] <= 1.2 * self.position["mid_price"]
         )
-        self.position.loc[~valid_mask, "vwap_5s"] = self.position.loc[~valid_mask, "mid_price"]
+        self.position.loc[~valid_mask, "vwap"] = self.position.loc[~valid_mask, "mid_price"]
         self.position["dh"] = np.nan
+        self.position["tick2_idx"] = idxs
+
         self.position["realized_position"] = 0
-        self.position["side"] = np.sign(self.to_position - self.from_position)
-        self.position["position"] = self.to_position
-        self.position["volume"] = self.position["volume_5s"] * 5
+        self.position["yeday_real"] = self.position["realized_position"].copy()
+
+        # Precompute rolling features in tick2 for get_state
+        idxs = np.searchsorted(self.tick2["version_ts"].values, self.position["version_ts"].values)
+        idxs = np.clip(idxs, 0, len(self.tick2) - 1)
+        feature_cols = ["signal_short", "signal_middle", "signal_long_1h"]
+        tick_features = self.tick2.loc[:, feature_cols].iloc[idxs].reset_index(drop=True)
+        self.position.loc[:, feature_cols] = tick_features.values
 
     def calc_expected_slippage(
-        self, tick2: pd.Series, delta_position: int, base_price: float, side: float, calc_realized_vol: bool = False
+        self, tick2: pd.DataFrame, delta_position: int, base_price: float, side: float, calc_realized_vol: bool = False
     ) -> float:
         """
         Calculate the expected slippage based on the tick2 data and the delta_position.
@@ -249,10 +237,10 @@ class FutureExecEnv:
         total_volume = 0.0
         total_slippage = 0.0
 
-        for i in range(1, 7):  #! 对应改成7
+        for i in range(1, 6):
             volume_col = f"{'ask' if sign == 1 else 'bid'}_volume{i}"
             price_col = f"{'ask' if sign == 1 else 'bid'}_price{i}"
-            if i <= 5:  #! 严格来说应该要<=5
+            if i < 5:  #! 严格来说应该要<=5
                 volume = min(tick2[volume_col], abs_delta - total_volume)
                 price = tick2[price_col]
             else:
@@ -265,189 +253,84 @@ class FutureExecEnv:
             if abs_delta == 0:
                 break
 
+        # print("total slippage:",total_slippage)
         return total_slippage
 
     @staticmethod
-    def trans_dict_norm(
-        state_dict_market,
-        state_dict_factor,
-        state_dict_volatility,
-        state_dict_process,
-        state_dict_slippage,
-        state_dict_event,
-        side,
-    ):
+    def trans_dict(state_dict):
+
         # state_dict["realized_position_ratio"] = state_dict["realized_position_ratio"] / 8
-
-        state_dict_market["vwap_5s_over_60s"] = (
-            np.sign(state_dict_market["vwap_5s_over_60s"])
-            * np.log(1 + np.abs(state_dict_market["vwap_5s_over_60s"]) / 3)
-            * side
+        state_dict["signal_short"] = state_dict["signal_short"] * state_dict["side"]
+        state_dict["signal_middle"] = state_dict["signal_middle"] * state_dict["side"]
+        state_dict["signal_long_1h"] = state_dict["signal_long_1h"] * state_dict["side"]
+        state_dict["cur_price/base_price"] = (
+            np.sign(state_dict["cur_price/base_price"])
+            * np.log(1 + np.abs(state_dict["cur_price/base_price"]) / 3)
+            * state_dict["side"]
         )
-        state_dict_market["vwap_30s_over_300s"] = (
-            np.sign(state_dict_market["vwap_30s_over_300s"])
-            * np.log(1 + np.abs(state_dict_market["vwap_30s_over_300s"]) / 3)
-            * side
+        state_dict["exp_slippage_bp"] = np.sign(state_dict["exp_slippage_bp"]) * np.log(
+            1 + np.abs(state_dict["exp_slippage_bp"]) / 3
         )
-        state_dict_market["vwap_rank_12x5s"] = state_dict_market["vwap_rank_12x5s"] * side
-        state_dict_market["vwap_rank_12x30s"] = state_dict_market["vwap_rank_12x30s"] * side
-        state_dict_market["cur_price/base_price"] = (
-            np.sign(state_dict_market["cur_price/base_price"])
-            * np.log(1 + np.abs(state_dict_market["cur_price/base_price"]) / 3)
-            * side
+        state_dict["now_slippage_bp"] = np.sign(state_dict["now_slippage_bp"]) * np.log(
+            1 + np.abs(state_dict["now_slippage_bp"]) / 3
         )
-        state_dict_market["pv_corr_24x5s"] = state_dict_market["pv_corr_24x5s"] * side
-        state_dict_market["shadow_vwap_dev"] = (
-            np.sign(state_dict_market["shadow_vwap_dev"])
-            * np.log(1 + np.abs(state_dict_market["shadow_vwap_dev"]) / 3)
-            * side
-        )
-        state_dict_market["fragility_24x5s_norm"] = state_dict_market["fragility_24x5s_norm"]
-        state_dict_market["KER_24x5s"] = state_dict_market["KER_24x5s"] * side
-        state_dict_market["Rejection_Bias_12x5s"] = state_dict_market["Rejection_Bias_12x5s"] * side
-        state_dict_market["Vol_Squeeze"] = state_dict_market["Vol_Squeeze"]
-        state_dict_market["Flow_Toxicity_12x5s"] = state_dict_market["Flow_Toxicity_12x5s"] * side
-
-        state_dict_factor["signal_5s"] = state_dict_factor["signal_5s"] * side
-        state_dict_factor["signal_1m"] = state_dict_factor["signal_1m"] * side
-        state_dict_factor["signal_1h"] = state_dict_factor["signal_1h"] * side
-
-        state_dict_volatility["vol_feat_300s"] = state_dict_volatility["vol_feat_300s"]
-        state_dict_volatility["pressure_12x5s"] = state_dict_volatility["pressure_12x5s"] * side
-        state_dict_volatility["smart_momentum_60x5s"] = state_dict_volatility["smart_momentum_60x5s"] * side
-        state_dict_volatility["Gini_300s"] = state_dict_volatility["Gini_300s"]
-        state_dict_volatility["vol_shock"] = state_dict_volatility["vol_shock"]
-        state_dict_volatility["log_position"] = state_dict_volatility["log_position"]
-
-        state_dict_process["pos_ratio"] = state_dict_process["pos_ratio"]
-        state_dict_process["participate_rate"] = state_dict_process["participate_rate"]
-        state_dict_process["market_ratio"] = state_dict_process["market_ratio"]
-        state_dict_process["gap_to_market"] = state_dict_process["gap_to_market"]
-
-        state_dict_slippage["exp_slippage_bp"] = np.sign(state_dict_slippage["exp_slippage_bp"]) * np.log(
-            1 + np.abs(state_dict_slippage["exp_slippage_bp"]) / 3
-        )
-        state_dict_slippage["now_slippage_bp"] = np.sign(state_dict_slippage["now_slippage_bp"]) * np.log(
-            1 + np.abs(state_dict_slippage["now_slippage_bp"]) / 3
-        )
-        # state_dict.pop("signal_1m", None) #! debug test
-        return {
-            **state_dict_market,
-            **state_dict_factor,
-            **state_dict_volatility,
-            **state_dict_process,
-            **state_dict_slippage,
-            **state_dict_event,
-        }
+        state_dict.pop("side", None)
+        # state_dict.pop("signal_middle", None) #! debug test
+        return state_dict
 
     def get_state(self) -> ARY:
-        if self.position is None:
+        if self.position is None or self.tick2 is None:
             raise ValueError("Environment not initialized. Call reset() first.")
-        pos = self.position.iloc[self.time_idx]
+        pos = self.position.loc[self.time_curr]
         consumed_time = self.time_curr - self.begin_time
         remain_time = self.end_time - self.time_curr
-        state_dict_market: dict[str, float] = {}
-        state_dict_factor: dict[str, float] = {}
-        state_dict_volatility: dict[str, float] = {}
-        state_dict_process: dict[str, float] = {}
-        state_dict_slippage: dict[str, float] = {}
-        state_dict_event: dict[str, float] = {}
-
-        state_dict_market["vwap_5s_over_60s"] = pos["vwap_5s_over_60s"].item()
-        state_dict_market["vwap_30s_over_300s"] = pos["vwap_30s_over_300s"].item()
-        state_dict_market["vwap_rank_12x5s"] = pos["vwap_rank_12x5s"].item()
-        state_dict_market["vwap_rank_12x30s"] = pos["vwap_rank_12x30s"].item()
-        state_dict_market["cur_price/base_price"] = (
-            pos["last_price"].item() / self.base_price - 1.0
-        ) * 10000  # 当前价格与基准价格的比率
-        state_dict_market["pv_corr_24x5s"] = pos["pv_corr_24x5s"].item()
-        state_dict_market["shadow_vwap_dev"] = (
-            (self.total_cum_turnover / (self.total_cum_volume + 1e-4) - self.base_price) / self.base_price * 10000
-        )
-        state_dict_market["fragility_24x5s_norm"] = pos["fragility_24x5s_norm"].item()
-        state_dict_market["KER_24x5s"] = pos["KER_24x5s"].item()
-        state_dict_market["Rejection_Bias_12x5s"] = pos["Rejection_Bias_12x5s"].item()
-        state_dict_market["Vol_Squeeze"] = pos["Vol_Squeeze"].item()
-        state_dict_market["Flow_Toxicity_12x5s"] = pos["Flow_Toxicity_12x5s"].item()
-
-        state_dict_factor["signal_5s"] = float(pos["signal_5s_norm"].item())
-        state_dict_factor["signal_1m"] = float(pos["signal_1m_norm"].item())
-        state_dict_factor["signal_1h"] = float(pos["signal_1h_norm"].item())
-
-        state_dict_volatility["vol_feat_300s"] = pos["vol_feat_300s"].item()
-        state_dict_volatility["pressure_12x5s"] = pos["pressure_12x5s"].item()
-        state_dict_volatility["smart_momentum_60x5s"] = pos["smart_momentum_60x5s"].item()
-        state_dict_volatility["Gini_300s"] = pos["Gini_300s"].item()
-        state_dict_volatility["vol_shock"] = pos["vol_shock"].item()
-        state_dict_volatility["log_position"] = np.log(1 + np.abs(self.to_position) / 50)
+        remain_pos_abs = np.abs(self.to_position - self.realized_position)
+        """print(
+            self.realized_position,
+            "-->",
+            self.to_position,
+            "\n",
+            self.total_time,
+            " consumed_time",
+           consumed_time,
+            " volume_30s:",
+            pos["vol_15s"],
+        )"""
+        state_dict: dict[str, float] = {}
+        state_dict["side"] = self.side  # 方向
+        state_dict["log_position"] = np.log(1 + np.abs(self.to_position) / 50)
         assert self.to_position != 0, "to_position should not be zero "
-
-        state_dict_process["pos_ratio"] = self.realized_position / self.to_position  # 已实现仓位占目标仓位的比例
-        # state_dict_process["consumed_time_ratio"] = consumed_time / self.total_time  # 已消耗时间占总时间的比例
+        state_dict["realized_ratio"] = self.realized_position / self.to_position  # 已实现仓位占目标仓位的比例
+        state_dict["consumed_time_ratio"] = consumed_time / self.total_time  # 已消耗时间占总时间的比例
         if remain_time == 0:
             print(self.id, self.begin_time, self.end_time)
             raise ValueError("No remaining time in the episode.")
-        state_dict_process["participate_rate"] = (
-            np.abs(self.realized_position) / ((self.total_cum_volume) + 1) / self.rate_upper_bound
-        )  # 已实现仓位占总成交量的比例，经过归一化
-        state_dict_process["market_ratio"] = self.total_cum_volume / (np.abs(self.to_position) * 50 + 1e-4)
-        state_dict_process["gap_to_market"] = state_dict_process["pos_ratio"] - state_dict_process["market_ratio"]
-
-        state_dict_slippage["exp_slippage_bp"] = (
+        state_dict["realized_position_ratio"] = np.abs(self.realized_position) / ((self.cum_volume / 100) + 1e-4)
+        state_dict["signal_short"] = pos["signal_short"]  # if pos["signal_short"] is not None else 0.0
+        state_dict["signal_middle"] = pos["signal_middle"]  # if pos["signal_middle"] is not None else 0.0
+        state_dict["signal_long_1h"] = 0.0 if pd.isna(pos["signal_long_1h"]) else pos["signal_long_1h"]
+        print(pos["last_price"], " and ", self.base_price)
+        state_dict["cur_price/base_price"] = (
+            pos["last_price"] / self.base_price - 1
+        ) * 10000  # 当前价格与基准价格的比率
+        tick_time = int(pos["tick2_idx"])
+        state_dict["exp_slippage_bp"] = (
             (
-                self.calc_expected_slippage(pos, self.to_position - self.realized_position, self.base_price, self.side)
-                + self.my_cum_slippage
+                self.calc_expected_slippage(
+                    self.tick2.iloc[tick_time], self.to_position - self.realized_position, self.base_price, self.side
+                )
+                + self.cum_slippage
             )
             / self.total_turnover
             * 10000
         )  # 预期滑点，单位为基点
-        state_dict_slippage["now_slippage_bp"] = (
-            (self.my_cum_slippage) / (self.my_cum_turnover + 1) * 10000
-        )  # 当前滑点，单位为基点
+        state_dict["now_slippage_bp"] = (self.cum_slippage) / (self.cum_turnover + 1) * 10000  # 当前滑点，单位为基点
 
-        state_dict_event["event_open_rush"] = pos["event_open_rush"].item()
-        state_dict_event["event_close_rush"] = pos["event_close_rush"].item()
-        state_dict_event["event_vol_breakout"] = pos["event_vol_breakout"].item()
-        state_dict_event["event_sig_spike"] = pos["event_sig_spike"].item()
-
-        """print(
-            "state_dict_market",
-            state_dict_market,
-            "\n",
-            "state_dict_factor",
-            state_dict_factor,
-            "\n",
-            "state_dict_volatility",
-            state_dict_volatility,
-            "\n",
-            "state_dict_process",
-            state_dict_process,
-            "\n",
-            "state_dict_slippage",
-            state_dict_slippage,
-            "\n",
-            "state_dict_event",
-            state_dict_event,
-        )"""
-
-        state_dict_trans_norm = self.trans_dict_norm(
-            state_dict_market,
-            state_dict_factor,
-            state_dict_volatility,
-            state_dict_process,
-            state_dict_slippage,
-            state_dict_event,
-            self.side,
-        )
-
-        try:
-            state_values = [state_dict_trans_norm[k] for k in self.STATE_FEATURES]
-        except KeyError as e:
-            raise KeyError(f"Feature key {e} missing in full_dict. Please check your dictionaries.")
+        state_dict_trans = self.trans_dict(state_dict)
         # print(state_dict_trans)  # prif action_arr.size == 1 else int(action_arr.argmax())
         # 拼接到 State 后面
         # print(state_dict)
-        State = np.array(state_values, dtype=np.float32)
+        State = np.array(list(state_dict_trans.values()), dtype=np.float32)
         # print(State)
         # time.sleep(1)
         if random.random() < 0.00000004:
@@ -459,7 +342,7 @@ class FutureExecEnv:
         if not np.isfinite(State).all():
             print("Warning: Non-finite values detected in state features, replacing with zeros.")
             print(State)
-            print(state_dict_trans_norm)
+            print(state_dict)
             print(self.samples)
             State = np.nan_to_num(State, nan=0.0, posinf=0.0, neginf=0.0)
             raise ValueError("Non-finite values detected in state features.")
@@ -479,21 +362,27 @@ class FutureExecEnv:
         return 0.04 * (action + 1)
 
     def step(self, action) -> Tuple[ARY, float, bool, bool, dict]:
-        if self.position is None:
+        if self.position is None or self.tick2 is None:
             raise ValueError("Environment not initialized. Call reset() first.")
         state = self.get_state()
         terminated = False
         truncated = False
+        i = self.time_idx
+        cur_ts = self.position.index[i]
+        pre_ts = cur_ts - 120
         cur_rate = self.action_range[int(action)] if self.if_discrete else self.convert_action_for_env(action)
-        # cur_rate = 0.08  #! debug
+        # cur_rate = 0.08 #! debug
         # if random.random() < 0.00005:
         #    print("action:", cur_rate)
 
         # print(cur_rate, "cur_rate") #pr
+        print(self.realized_position, "realized_position")
+        print(f"Step {i}, cur_ts: {cur_ts}, cur_rate: {cur_rate}")
         dh = self.to_position - self.realized_position
         side = np.sign(dh)
         dh = abs(dh)
-        cap = cur_rate * self.position.iloc[self.time_idx + 1]["volume"]
+        self.cum_volume += self.position.iloc[i + 1]["volume"]
+        cap = cur_rate * self.position.iloc[i + 1]["volume"]
         cap_int = int(cap)
         cap_xs = cap - cap_int
         num = np.random.random()
@@ -502,8 +391,10 @@ class FutureExecEnv:
         cap = cap_int
         dh = min(dh, cap)
 
+        cur_idx = self.position.index[i]
+        new_idx = self.position.index[i + 1]
         self.realized_position = int(self.realized_position + side * dh)
-        """print(
+        print(
             self.from_position,
             "-->",
             self.to_position,
@@ -516,19 +407,17 @@ class FutureExecEnv:
             "base_price:",
             self.base_price,
             "vwap:",
-            self.position.iloc[self.time_idx + 1]["vwap_5s"],
-        )"""
+            self.position.iloc[self.time_idx + 1]["vwap"],
+        )
         self.time_idx += 1
         self.time_curr += self.freq
-        self.my_cum_turnover += dh * self.position.iloc[self.time_idx]["vwap_5s"]
-        self.my_cum_slippage += dh * side * (self.position.iloc[self.time_idx]["vwap_5s"] - self.base_price)
-        self.total_cum_volume += self.position.iloc[self.time_idx]["volume"]
-        self.total_cum_turnover += (
-            self.position.iloc[self.time_idx]["volume"] * self.position.iloc[self.time_idx]["vwap_5s"]
-        )
+        self.cum_turnover += dh * self.position.iloc[i + 1]["vwap"]
+        self.cum_slippage += dh * side * (self.position.iloc[self.time_idx]["vwap"] - self.base_price)
+        # print(self.cum_slippage, "cum_slippage")
         reward = self.Calc_reward(  #! 这里必须要带方向的变化量
-            dh * side, self.base_price, self.position.iloc[self.time_idx]["vwap_5s"]
+            dh * side, self.base_price, self.position.iloc[self.time_idx]["vwap"]
         )
+        print("reward:", reward, "cum_reward:", self.cum_reward)
         self.cum_reward += reward
         if self.time_idx == len(self.position) - 1:
             terminated = True
@@ -551,7 +440,7 @@ class FutureExecEnv:
                 self.tot_uncompleted += 1
                 final_slippage = (
                     self.calc_expected_slippage(
-                        self.position.iloc[self.time_idx],
+                        self.tick2.iloc[-1],
                         self.to_position - self.realized_position,
                         self.base_price,
                         self.side,
@@ -561,9 +450,8 @@ class FutureExecEnv:
                 )  # pe
                 self.cum_reward -= final_slippage
                 reward -= final_slippage
-            assert (
-                self.realized_position == self.to_position
-            ), f"Realized position does not match target position. {self.realized_position} != {self.to_position}, id={self.id}, begin_time={self.begin_time}, end_time={self.end_time}, absolute_id={self.absolute_id}"
+
+            assert self.realized_position == self.to_position, "Realized position does not match target position."
 
         if terminated:
             new_state = state
@@ -616,7 +504,6 @@ def check_stock_trading_env():
             "class": "plus5_sample",
         }
     )  # Example ID and index"""
-    # target_id = "100003380"
     target_id = "100000792"
     set_id = -1
     for idx, sample in enumerate(env.sample_pool):
@@ -654,13 +541,17 @@ def check_stock_trading_env():
         print("Truncated:", truncated)"""
         # print("Info:", info)
         reward_cum += reward
-        print("Reward: ", reward)
+        # print("Reward: ", reward)
         if terminated or truncated:
             slippage_bp.append(-reward_cum)
             if random.random() < 1:
                 print(-reward_cum, np.mean(slippage_bp))
             # print("-----------end-----------")
             id += 1
+            # 173281
+            # 38539
+            # 43912
+            # 347709 - 10 = 347699
             if id == 10:
                 break
             state, info = env.reset(sequential=True)

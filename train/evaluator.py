@@ -376,7 +376,7 @@ def Get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float
     return returns_step_list
 
 
-def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN, TEN]:
+def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN, TEN, List[float], List[float]]:
     import multiprocessing
     from copy import deepcopy
 
