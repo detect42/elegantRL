@@ -23,7 +23,8 @@ class AgentReinforce(AgentBase):
 
         # 1. 初始化 Actor (使用自定义的 Discrete Actor)
         self.act = ActorDiscreteReinforce(state_dim, action_dim, args.agent.actor).to(self.device)
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), args.agent.actor_learning_rate)
+        wd = args.agent.weight_decay
+        self.act_optimizer = th.optim.Adam(self.act.parameters(), args.agent.actor_learning_rate, weight_decay=wd)
 
         # 2. 算法模式配置
         self.mode = args.agent.mode  # "REINFORCE" 或 "GRPO"
@@ -141,6 +142,7 @@ class AgentReinforce(AgentBase):
         return actions, logprobs
 
     def update_net(self, buffer) -> Dict[str, float]:
+        self.act.train()  #! 这里确保 update_net 时 Actor 处于训练模式（启用 dropout 等）
         """
         buffer shapes（explore 末尾已统一）：
         states: (H, N, D)
@@ -379,7 +381,8 @@ class AgentReinforce(AgentBase):
 class ActorDiscreteReinforce(ActorBase):
     def __init__(self, state_dim: int, action_dim: int, cfg: DictConfig):
         super().__init__(state_dim=state_dim, action_dim=action_dim)
-        self.net = build_mlp(dims=[state_dim, *cfg.mlp_args.net_dims, action_dim])
+        dropout_p = cfg.dropout_p
+        self.net = build_mlp(dims=[state_dim, *cfg.mlp_args.net_dims, action_dim], dropout_p=dropout_p)
         layer_init_with_orthogonal(self.net[-1], std=0.5)
         self.ActionDist: type[th.distributions.Categorical] = th.distributions.Categorical
         self.greedy_eps: float = cfg.greedy_eps

@@ -12,6 +12,7 @@ from ..train import ReplayBuffer
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
 from abc import ABC, abstractmethod
+
 TEN = th.Tensor
 
 """agent"""
@@ -71,7 +72,7 @@ class AgentBase:
         else:
             return self._explore_one_env(env=env, horizon_len=horizon_len)
 
-    def explore_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]: #! action or (action,logprob)
+    def explore_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]:  #! action or (action,logprob)
         return self.act.get_action(state)  #! agentbase里没有定义get_action方法
 
     def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
@@ -184,7 +185,11 @@ class AgentBase:
         unmasks = th.logical_not(truncates)
         return states, actions, rewards, undones, unmasks
 
-    def update_net(self, buffer: ReplayBuffer) -> dict[str, float]:  #! on-policy算法比如ppo 这里的buffer就是tuple，不是class，所以需要在对应子类agent redefine这个function
+    def update_net(
+        self, buffer: ReplayBuffer
+    ) -> dict[
+        str, float
+    ]:  #! on-policy算法比如ppo 这里的buffer就是tuple，不是class，所以需要在对应子类agent redefine这个function
         objs_critic = []
         objs_actor = []
 
@@ -192,7 +197,7 @@ class AgentBase:
             buffer.update_cum_rewards(get_cumulative_rewards=self.get_cumulative_rewards)
 
         th.set_grad_enabled(True)
-        update_times = int(buffer.cur_size * buffer.num_seqs * self.repeat_times / self.batch_size) #! add * num_seqs
+        update_times = int(buffer.cur_size * buffer.num_seqs * self.repeat_times / self.batch_size)  #! add * num_seqs
         for update_t in range(update_times):
             obj_critic, obj_actor = self.update_objectives(buffer=buffer, update_t=update_t)
             objs_critic.append(obj_critic)
@@ -348,7 +353,6 @@ class CriticBase(nn.Module, ABC):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.net: nn.Module  # build_mlp(net_dims=[state_dim + action_dim, *net_dims, 1])
-
 
     """def forward(self, state: TEN, action: TEN) -> TEN:
         values = self.get_q_values(state=state, action=action)
@@ -638,7 +642,11 @@ def build_tcn(
 
 
 def build_mlp(
-    dims: list[int], activation: Optional[type[nn.Module]] = None, if_raw_out: bool = True, use_ln: bool = False
+    dims: list[int],
+    activation: Optional[type[nn.Module]] = None,
+    if_raw_out: bool = True,
+    use_ln: bool = False,
+    dropout_p: float = 0.0,
 ) -> nn.Sequential:
     """
     build MLP (MultiLayer Perceptron)
@@ -660,6 +668,9 @@ def build_mlp(
     # 原始 MLP 逻辑
     for i in range(len(dims) - 1):
         net_list.extend([nn.Linear(dims[i], dims[i + 1]), activation()])
+        if dropout_p > 0.0 and i < len(dims) - 2:
+            net_list.append(nn.Dropout(p=dropout_p))
+            
     if if_raw_out:
         del net_list[-1]  # 删除最后一层激活
 

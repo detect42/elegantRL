@@ -29,13 +29,13 @@ class FutureExecEnv:
             "vwap_5s_over_60s",
             "vwap_30s_over_300s",
             "vwap_rank_12x5s",
-            "vwap_rank_12x30s",
+            # "vwap_rank_12x30s",      # 删减：与 12x5s 严重共线，保留高频捕捉
             "cur_price/base_price",
-            "pv_corr_24x5s",
-            "shadow_vwap_dev",
-            "fragility_24x5s_norm",
+            # "pv_corr_24x5s",         # 删减：相关性特征在非平稳序列中容易漂移
+            # "shadow_vwap_dev",       # 删减：被 cur_price/base_price 覆盖
+            # "fragility_24x5s_norm",  # 删减：因子解释度不如动量特征
             "KER_24x5s",
-            "Rejection_Bias_12x5s",
+            # "Rejection_Bias_12x5s",  # 删减：盘口压力被 Flow_Toxicity 覆盖
             "Vol_Squeeze",
             "Flow_Toxicity_12x5s",
             # Factor
@@ -43,24 +43,24 @@ class FutureExecEnv:
             "signal_1m",
             "signal_1h",
             # Volatility
-            "vol_feat_300s",
-            "pressure_12x5s",
+            # "vol_feat_300s",         # 删减：信息已被 Squeeze/Shock 吸收
+            # "pressure_12x5s",        # 删减：属于盘口快照，毒性特征更稳健
             "smart_momentum_60x5s",
-            "Gini_300s",
+            # "Gini_300s",             # 删减：计算开销大且对 RL 信号增益比低
             "vol_shock",
             "log_position",
             # Process
             "pos_ratio",
             "participate_rate",
-            "market_ratio",
+            "market_ratio",  # 保留：实盘部署的基准进度坐标
             "gap_to_market",
             # Slippage
             "exp_slippage_bp",
             "now_slippage_bp",
             # Event
-            "event_open_rush",
-            "event_close_rush",
-            "event_vol_breakout",
+            # "event_open_rush",       # 删减：按要求去除
+            # "event_close_rush",      # 删减：按要求去除
+            # "event_vol_breakout",    # 删减：按要求去除
             "event_sig_spike",
         ]
         self.num_envs = cfg.num_envs
@@ -71,6 +71,7 @@ class FutureExecEnv:
         self.padding0: bool = cfg.padding0
         self.max_step: int = cfg.max_step
         self.eval_num_workers: int = cfg.eval_num_workers
+        self.noise_std_ratio: float = cfg.noise_std_ratio
         self.device = th.device("cpu") if cfg.gpu_id == -1 else th.device(f"cuda:{cfg.gpu_id}")
         self.tot_uncompleted = 0
         self.dataset = "1_sample"
@@ -85,6 +86,7 @@ class FutureExecEnv:
         self.uncompleted = False  # whether the current episode is uncompleted
         # environment information
         self.env_name: str = "FutureExecEnv_v8"
+        self.mode: str = "sample"  # 默认 mode
 
         # self.max_step = 19260817
         self.freq = 5
@@ -166,6 +168,7 @@ class FutureExecEnv:
                 sample = self.sample_pool[set_id]
             else:
                 raise ValueError(f"Unknown mode: {mode}")
+        self.mode = mode
         self.samples = sample
         self.id = sample["id"]
         self.absolute_id = int(sample["Absolute_ID"])
@@ -448,6 +451,12 @@ class FutureExecEnv:
         # 拼接到 State 后面
         # print(state_dict)
         State = np.array(state_values, dtype=np.float32)
+        if self.mode == "sample" and self.noise_std_ratio > 0.0:
+            # 生成均值为 1.0，标准差为 noise_std_ratio 的正态分布随机数
+            noise_multiplier = np.random.normal(loc=1.0, scale=self.noise_std_ratio, size=State.shape).astype(
+                np.float32
+            )
+            State = State * noise_multiplier
         # print(State)
         # time.sleep(1)
         if random.random() < 0.00000004:

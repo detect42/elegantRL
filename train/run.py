@@ -104,6 +104,7 @@ def train_agent_single_process(args: DictConfig):
 
     if_train = True
     while if_train:
+        agent.act.train()
         buffer_items = agent.explore_env(env, horizon_len)
         """buffer_items
         buffer_items = (states, actions,           rewards, undones, unmasks)  # off-policy
@@ -129,6 +130,7 @@ def train_agent_single_process(args: DictConfig):
         logging_dict = {**logging_dict, "show_str": show_str}
         th.set_grad_enabled(False)
 
+        agent.act.eval()
         evaluator.evaluate_and_save(actor=agent.act, steps=horizon_len, exp_r=exp_r, logging_dict=logging_dict)
         if_train = (evaluator.total_step <= break_step) and (not os.path.exists(f"{cwd}/stop"))
 
@@ -476,6 +478,9 @@ class Worker(Process):
                 agent.act = (
                     actor.to(agent.device) if os.name == "nt" else actor
                 )  # WindowsNT_OS can only send cpu_tensor
+
+                agent.act.train()
+
                 # t0 = time.time()  #!
                 """Worker send the training data to Learner"""
                 #! 定向config 这里传入除起点外剩下的case 绝对id来运行,explore_env最后可添加tasj_config参数
@@ -526,6 +531,7 @@ class EvaluatorProc(Process):
                 evaluator.total_step += steps  # update total_step but don't update recorder
             else:
                 actor = actor.to(device) if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
+                actor.eval()
                 evaluator.evaluate_and_save(actor=actor, steps=steps, exp_r=exp_r, logging_dict=logging_dict)
 
             """Evaluator send the training signal to Learner"""
