@@ -40,8 +40,8 @@ def process_config(cfg: DictConfig) -> DictConfig:
         f"| Config: Scaled batch_size={cfg.train.batch_size}, horizon_len={cfg.train.horizon_len}, buffer_size={cfg.train.buffer_size}"
     )
 
-    cfg.env.gpu_id = cfg.sys.gpu_id
-    cfg.eval.env.gpu_id = cfg.sys.gpu_id
+    #cfg.env.gpu_id = cfg.sys.gpu_id
+    #cfg.eval.env.gpu_id = cfg.sys.gpu_id
     cfg.eval.env.K = cfg.env.K
     # [Step 3] 逻辑 B: 自动推断 Off-policy
     if not hasattr(cfg.agent, "if_off_policy") or (cfg.agent.if_off_policy is None):
@@ -56,7 +56,8 @@ def process_config(cfg: DictConfig) -> DictConfig:
     cfg.eval.cwd = current_log_dir
 
     # [Step 5] 逻辑 D: 随机种子
-    cfg.sys.random_seed = cfg.sys.random_seed if cfg.sys.random_seed is not None else max(0, cfg.sys.gpu_id)
+    import random
+    cfg.sys.random_seed = cfg.sys.random_seed if cfg.sys.random_seed is not None else random.randint(0, 1000000)
     # [Step 4] 关锁：处理完毕，禁止后续代码随意添加新 Key，防止拼写错误
     OmegaConf.set_struct(cfg, True)
 

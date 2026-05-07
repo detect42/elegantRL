@@ -11,14 +11,17 @@ env: &env_config
   test_date_list_path: "/home/songrui.wang/RL_training/conf/date/1day.txt"
   mode: "train"                            # 环境模式 (train/test)
   action_mapping:
-    0: [0.0, 0]
-    1: [1.0, 1]
+    0: 0.0
+    1: 0.02
+    2: 0.04
+    3: 0.06
+    4: 0.08
   eval_num_workers: 16                   # 评估时的并行环境数量
   sample_method: "seq"                       #! 采样方法 (random/seq/weighted) 测试环境里必须的
   num_envs: 1                          # 向量化子环境数量 (1为单环境, >1为向量化环境)
   max_step: 99999                        # 每个 Episode 的最大步数
-  state_dim: 25                        #? 状态维度 (Python 代码中会根据 K 计算)
-  action_dim: 2                          # 动作维度
+  state_dim: 30                        #? 状态维度 (Python 代码中会根据 K 计算)
+  action_dim: 5                          # 动作维度
   lambda_decay: 0.04
   if_discrete: true                      #! 是否为离散动作空间
   gpu_id: -1

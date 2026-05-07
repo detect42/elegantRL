@@ -1,6 +1,7 @@
 from __future__ import annotations
 import math
 import random
+import time
 from copy import deepcopy
 from typing import Any, List, Optional, Tuple, cast
 
@@ -64,8 +65,19 @@ class AgentModSACDiscrete(AgentBase):
         self.critic_value = 1.0
         self.update_a = 0
 
+        """
+        #! compile 会在eval使用onnx的时候报错
+        print("⚡ [JIT] 正在注入 torch.compile 编译引擎...")
+        # 对 CPU 来说，默认 mode 即可。
+        self.act = th.compile(self.act)
+        self.cri = th.compile(self.cri)
+        self.act_target = th.compile(self.act_target)
+        self.cri_target = th.compile(self.cri_target)
+        print("⚡ [JIT] 编译引擎注入完成！")"""
+
     def explore_action(self, state: TEN) -> TEN:
         # 环境交互：返回离散索引（Long）
+       
         return self.act.get_action(state)
 
     def update_net(self, buffer: ReplayBuffer) -> dict[str, float]:
@@ -78,6 +90,7 @@ class AgentModSACDiscrete(AgentBase):
             buffer.update_cum_rewards(get_cumulative_rewards=self.get_cumulative_rewards)
 
         th.set_grad_enabled(True)
+        print("buffer.cur_size: ", buffer.cur_size, " buffer.num_seqs: ", buffer.num_seqs, " repeat_times: ", self.repeat_times, " batch_size: ", self.batch_size)
         update_times = int(buffer.cur_size * buffer.num_seqs * self.repeat_times / self.batch_size)  #! add * num_seqs
         for update_t in range(update_times):
             obj_critic, obj_actor, current_entropy = self.update_objectives(buffer=buffer, update_t=update_t)
@@ -85,6 +98,7 @@ class AgentModSACDiscrete(AgentBase):
             objs_actor.append(obj_actor) if isinstance(obj_actor, float) else None
             objs_entropy.append(current_entropy)
         th.set_grad_enabled(False)
+
 
         obj_avg_critic = np.array(objs_critic).mean() if len(objs_critic) else 0.0
         obj_avg_actor = np.nanmean(np.array(objs_actor)) if len(objs_actor) else 0.0
@@ -106,7 +120,6 @@ class AgentModSACDiscrete(AgentBase):
                 action_idx = action.squeeze(-1).long()
             else:
                 action_idx = action.long()
-
             # ---- 目标：V'(s') 的期望 ----
             alpha = self.alpha_log.exp()
             probs_next, log_probs_next = self.act_target.policy(next_state)  # [B,K]
@@ -118,7 +131,8 @@ class AgentModSACDiscrete(AgentBase):
         # ---- critic：Huber over heads ----
         Q_heads = self.cri.get_q_values(state, action_idx)  # [B,N], N is num_ensembles
 
-        q_labels = q_label.view((-1, 1)).repeat(1, Q_heads.shape[1])
+        #q_labels = q_label.view((-1, 1)).repeat(1, Q_heads.shape[1])
+        q_labels = q_label.view((-1, 1)).expand(-1, Q_heads.shape[1])
         if random.random() < 0.0001:
             print("Q_heads: ", Q_heads[:5].detach().cpu().numpy().round(2))
             print("q_labels: ", q_labels[:5].detach().cpu().numpy().round(2))
@@ -130,7 +144,6 @@ class AgentModSACDiscrete(AgentBase):
             buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
         else:
             obj_critic = td_error.mean()
-
         self.optimizer_backward(self.cri_optimizer, obj_critic)
         self.soft_update(self.cri_target, self.cri, self.soft_update_tau)
 
@@ -162,7 +175,6 @@ class AgentModSACDiscrete(AgentBase):
             obj_actor = -actor_loss.detach().item()  # 为了与连续版返回“越大越好”的一致性
         else:
             obj_actor = float("nan")
-
         return obj_critic.item(), obj_actor, current_entropy
 
 
@@ -237,8 +249,7 @@ class ActorDiscreteSAC(ActorBase):
     def get_action(self, state: TEN) -> TEN:
         probs, _ = self.policy(state)
 
-        dist = th.distributions.Categorical(probs=probs)
-        action_idx = dist.sample()  # [B]
+        action_idx = th.multinomial(probs, 1).squeeze(-1)
 
         if random.random() < 0.000001:
             print(
@@ -253,9 +264,8 @@ class ActorDiscreteSAC(ActorBase):
 
     def get_action_logprob(self, state: TEN) -> Tuple[TEN, TEN]:
         probs, log_probs = self.policy(state)
-        dist = th.distributions.Categorical(probs=probs)
-        action_idx = dist.sample()
-        logprob = dist.log_prob(action_idx)  # [B]
+        action_idx = th.multinomial(probs, 1).squeeze(-1) # [B]
+        logprob = log_probs.gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
         return action_idx, logprob
 
     @staticmethod

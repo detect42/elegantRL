@@ -10,25 +10,37 @@ from omegaconf import DictConfig, OmegaConf
 from threadpoolctl import threadpool_limits
 
 TEN = th.Tensor
-_GLOBAL_ENV = None
-_GLOBAL_ONNX_BYTES = None
 
-def _eval_worker(case_ids, max_step, mode: str = "test"):
+
+def _eval_worker(actor_cpu, env, case_ids, max_step, device_type="cpu", mode: str = "test"):
     """
     运行在子进程中的评测逻辑
     """
     import io
     import onnxruntime as ort
     th.set_num_threads(1)
-    global _GLOBAL_ENV, _GLOBAL_ONNX_BYTES
-    env = _GLOBAL_ENV
-    onnx_model_bytes = _GLOBAL_ONNX_BYTES
+    time_begin = time.time()
+    inference_time = 0.0
+    step_time = 0.0
+    reset_time = 0.0
     with threadpool_limits(limits=1, user_api="blas"):
         # 确保 actor 在 CPU 上，并且是评估模式
+        actor_cpu.eval()
+        onnx_buffer = io.BytesIO()
+        dummy_state = th.zeros((1, env.state_dim), dtype=th.float32, device="cpu")
+        # 导出整个 actor (因为评估时调用 forward 返回 argmax 动作)
+        th.onnx.export(
+            actor_cpu, 
+            (dummy_state,), 
+            onnx_buffer, # type: ignore
+            input_names=['state'], 
+            output_names=['action'],
+            opset_version=14
+        )
         sess_options = ort.SessionOptions()
         sess_options.intra_op_num_threads = 1
         sess_options.inter_op_num_threads = 1
-        ort_session = ort.InferenceSession(onnx_model_bytes, sess_options, providers=['CPUExecutionProvider'])
+        ort_session = ort.InferenceSession(onnx_buffer.getvalue(), sess_options, providers=['CPUExecutionProvider'])
         results = []
         action_counts = None
         if env.if_discrete:
@@ -37,7 +49,7 @@ def _eval_worker(case_ids, max_step, mode: str = "test"):
                 action_counts = np.zeros(action_dim, dtype=np.int64)
 
         # 为了避免每次 step 都创建 tensor 的开销，预先定义好 device
-        #device = th.device(device_type)
+        device = th.device(device_type)
 
         with th.no_grad():
             
@@ -45,14 +57,15 @@ def _eval_worker(case_ids, max_step, mode: str = "test"):
                 # print(set_id)
                 # === 核心修改：传入 seq 参数 ===
                 # 假设您的 env.reset 支持 seq 参数
-                state, case_info = env.reset(set_id=set_id, mode=mode)
-                if case_info.get("skipped", False):
-                    print(f"Case {case_info['file_path']} 已标记为跳过，直接进入下一 case。")
-                    continue
+                if random.random() < 0.0001:
+                    print(f"| Eval Worker: set_id={set_id} mode={mode} time_cost={time.time() - time_begin:.2f}s inference_time={inference_time:.2f}s step_time={step_time:.2f}s reset_time={reset_time:.2f}s", flush=True)
+                
+                reset_time_start = time.time()
+                state, _ = env.reset(set_id=set_id, mode=mode)
+                reset_time += time.time() - reset_time_start
                 cumulative_returns = 0.0
-                total_amount_cum = 0.0
-                actual_amount_cum = 0.0
                 episode_steps = 0
+
                 for _ in range(max_step):
                     # 转 Tensor
                     """tensor_state = th.as_tensor(state, dtype=th.float32, device=device).unsqueeze(0)
@@ -60,7 +73,9 @@ def _eval_worker(case_ids, max_step, mode: str = "test"):
                     action = tensor_action.detach().numpy()[0]  # 已经是 CPU 了"""
 
                     state_np = state.reshape(1, -1) if state.ndim == 1 else state
+                    inference_time_start = time.time()
                     action_array = ort_session.run(None, {'state': state_np})[0]
+                    inference_time += time.time() - inference_time_start
                     if env.if_discrete:
                         action = int(action_array.item())
                     else:
@@ -74,15 +89,23 @@ def _eval_worker(case_ids, max_step, mode: str = "test"):
                     #print(set_id, _, mode, action)
                     # 环境交互
                     #print(action)
-                    state, reward, terminated, truncated, info = env.step(action)
+                    step_time_start = time.time()
+                    state, reward, terminated, truncated, _ = env.step(action)
+                    step_time += time.time() - step_time_start
                     cumulative_returns += reward
                     episode_steps += 1
+
                     if terminated or truncated:
-                        total_amount_cum += info["ideal_total_amount"]
-                        actual_amount_cum += info["actual_total_amount"]
                         break
+
                 # 记录结果 (reward, step)
-                results.append((cumulative_returns, episode_steps,actual_amount_cum, total_amount_cum))
+                results.append((cumulative_returns, episode_steps))
+    total_cost = time.time() - time_begin
+    print(f"| [Worker Done] Processed {len(case_ids)} cases. "
+            f"Total={total_cost:.2f}s, "
+            f"Reset={reset_time:.2f}s, "
+            f"Infer={inference_time:.2f}s, "
+            f"Step={step_time:.2f}s", flush=True)
     return results, action_counts
 
 
@@ -90,7 +113,7 @@ class Evaluator:
     def __init__(self, cwd: str, env, args: DictConfig, if_tensorboard: bool = False):
         self.cwd = cwd  # current working directory to save model
         self.env = env  # the env for Evaluator, `eval_env = env` in default
-        self.agent_id = args.sys.learner_gpu_id
+        self.agent_id = args.sys.gpu_id
         self.total_step = 0  # the total training step
         self.start_time = time.time()  # `used_time = time.time() - self.start_time`
         self.eval_times = args.eval.times  # number of times that get episodic cumulative return
@@ -179,13 +202,9 @@ class Evaluator:
         std_r_test: Union[float, None] = None
         avg_s_test: Union[float, None] = None
         std_s_test: Union[float, None] = None
-        actual_amount_sum:float
-        total_amount_sum :float
         if rewards_step_ten_test is not None:
             test_returns = rewards_step_ten_test[:, 0]
             test_steps = rewards_step_ten_test[:, 1]
-            actual_amount_sum = rewards_step_ten_eval[:, 2].sum().item()
-            total_amount_sum = rewards_step_ten_eval[:, 3].sum().item()
             avg_r_test = test_returns.mean().item()
             std_r_test = test_returns.std().item()
             avg_s_test = test_steps.mean().item()
@@ -237,9 +256,9 @@ class Evaluator:
             eval_action_pct_str = " eval_action_pct=[" + ", ".join(f"{p:.2f}%" for p in eval_action_pct) + "]"
         if test_action_pct is not None:
             test_action_pct_str += " test_action_pct=[" + ", ".join(f"{p:.2f}%" for p in test_action_pct) + "]"
-        completed_ratio = float(actual_amount_sum) / float(total_amount_sum) if total_amount_sum != 0 else 0
+
         print(
-            f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} {completed_ratio:6.1%} |"
+            f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} |"
             f"{avg_r:8.2f}{std_r:7.1f}{avg_s:7.0f}{std_s:6.0f} |"
             f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in value_tuple)} {logging_str}|",
             f"{avg_r_test:8.2f}{std_r_test:7.1f}{avg_s_test:7.0f}{std_s_test:6.0f}" if avg_r_test is not None else "",
@@ -399,22 +418,17 @@ def Get_cumulative_rewards_and_step_from_vec_env(env, actor) -> List[Tuple[float
 
 def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN, TEN, List[float], List[float]]:
     import multiprocessing
-    import io
     from copy import deepcopy
     import numpy as np
-    global _GLOBAL_ENV, _GLOBAL_ONNX_BYTES
+
     # 1. 准备配置
     num_workers = env.eval_num_workers
-    env_copy = deepcopy(env) 
-    _GLOBAL_ENV = env_copy
+
     # 4. 准备 Actor (必须转到 CPU !)
     # GPU 模型在多进程 Fork/Spawn 时极易出错且效率低 (Batch=1时)
     actor_cpu = deepcopy(actor).to("cpu")
     actor_cpu.eval()  # 确保是评估模式
-    onnx_buffer = io.BytesIO()
-    dummy_state = th.zeros((1, env.state_dim), dtype=th.float32, device="cpu")
-    th.onnx.export(actor_cpu, (dummy_state,), onnx_buffer, input_names=['state'], output_names=['action'], opset_version=14) # type: ignore
-    _GLOBAL_ONNX_BYTES = onnx_buffer.getvalue()
+
     # 5. 准备 Environment
     # 注意：如果 self.env 包含不可序列化的对象（如 C++ 指针、打开的文件句柄），
     # 这里直接传 self.env 会报错。
@@ -427,9 +441,12 @@ def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN
         # 3. 将任务 ID 切分为 chunks 分发给 Worker
         chunks = np.array_split(all_ids, num_workers)
 
+        # 5. 准备 Environment (独立拷贝，避免状态干扰)
+        env_copy = deepcopy(env)
+
         # 6. 组装参数
-        worker_args = [(chunk, env.max_step, mode) for chunk in chunks]
-        ctx = multiprocessing.get_context("fork")
+        worker_args = [(actor_cpu, env_copy, chunk, env.max_step, "cpu", mode) for chunk in chunks]
+
         # 7. 启动并行池
         try:
             ctx = multiprocessing.get_context("fork")
@@ -438,7 +455,7 @@ def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN
 
         with ctx.Pool(processes=num_workers) as pool:
             results_nested = pool.starmap(_eval_worker, worker_args)
-        
+
         flat_results = []
         action_counts_total = None
         for sub_results, sub_counts in results_nested:
@@ -462,7 +479,7 @@ def Get_cumulative_rewards_and_step_single_env_parallel(env, actor) -> Tuple[TEN
     rewards_steps_ten_test, test_action_pct = _run_mode("test", env.test_pool_size)
     t1 = time.time()
     total_time = t1 - t0
-    #?print(f"| Eval+Test Time Cost: {total_time:.2f} seconds", flush=True)
+    print(f"| Eval+Test Time Cost: {total_time:.2f} seconds", flush=True)
 
     return rewards_steps_ten_train, rewards_steps_ten_test, train_action_pct, test_action_pct
 

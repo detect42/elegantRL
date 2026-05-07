@@ -7,6 +7,7 @@ from torch.distributions import Distribution
 from typing import Tuple, Dict, List, Any, Optional
 from omegaconf import DictConfig
 from torch import nn
+
 from .AgentBase import AgentBase, ActorBase, build_mlp, layer_init_with_orthogonal
 import os
 
@@ -40,14 +41,18 @@ class AgentReinforce(AgentBase):
 
         self.valid_count: int = 0
 
-    def _explore_one_env(self, env, horizon_len: int, task_config: Dict[str, Any]) -> Tuple[TEN, ...]:
+    def _explore_one_env(self, env, horizon_len: int, task_config: Optional[Dict] = None) -> Tuple[TEN, ...]:
         """
         Fixed Horizon Collection.
         严格采集 horizon_len 步数据。
         若最后一段 episode 未在 horizon 内完成，则把该段所有 step 的 id 标记为 -1（用于训练时丢弃）。
         """
-        train_temp_tau = task_config["temperature"]
-        train_greedy_eps = task_config["greedy_eps"]
+        assert task_config["temperature"] is not None, "For REINFORCE, task_config must include 'temperature' for exploration."
+        # 1) 解析任务配置
+        if task_config is not None:
+            temperature = float(task_config.get("temperature", 1.0))
+        else:
+            temperature = 1.0
 
         # 2) 预分配固定大小 Tensor（不带 num_envs 维度）
         states = th.zeros((horizon_len, self.state_dim), dtype=th.float32, device=self.device)
@@ -77,10 +82,20 @@ class AgentReinforce(AgentBase):
         # 记录当前 horizon 内“最后一个 episode 的起点”，用于最终标记不完整尾段
         last_ep_start_idx = 0
 
+        # 4) 固定长度循环
+        import time
+        time_start = time.time()
+        time_cum_net = 0.0
         for t in range(horizon_len):
             # A) sample action
-            action, logprob = self.explore_action(state, temperature=train_temp_tau,greedy_eps=train_greedy_eps)
-    
+            #if t % 1000 == 0:  #! debug
+            #    print(f"Exploring step {t}/{horizon_len} with temperature {temperature:.3f}")
+            #    print(f"Time elapsed: {time.time() - time_start:.2f}s, cumulative net time: {time_cum_net:.2f}s", "ratio:", time_cum_net / (time.time() - time_start) if time.time() - time_start != 0 else 0)
+
+            time_net_start = time.time()
+            action, logprob = self.explore_action(state, temperature=temperature)
+            time_cum_net += time.time() - time_net_start
+
             # 记录轨迹数据
             states[t] = state.squeeze(0)
             actions[t] = action.squeeze(0) if (self.if_discrete and action.ndim > 0) else action
@@ -135,8 +150,8 @@ class AgentReinforce(AgentBase):
 
         return states, actions, logprobs, rewards, undones, unmasks, ids, target_position_vols
 
-    def explore_action(self, state: TEN, temperature: float=1.0, greedy_eps: float=0.0) -> Tuple[TEN, TEN]:
-        actions, logprobs = self.act.get_action(state=state, temperature=temperature, greedy_eps=greedy_eps)
+    def explore_action(self, state: TEN, temperature: float = 1.0) -> Tuple[TEN, TEN]:
+        actions, logprobs = self.act.get_action(state=state, temperature=temperature)
         return actions, logprobs
 
     def update_net(self, buffer) -> Dict[str, float]:
@@ -179,26 +194,22 @@ class AgentReinforce(AgentBase):
             assert (
                 actions.shape[2] == self.action_dim
             ), f"actions last dim {actions.shape[2]} != action_dim {self.action_dim}"
+
         # ==========================================================
         # 1) advantages / weights (H, N)
         # ==========================================================
         full_advantages, full_weights = self.get_advantages(rewards, undones, ids, target_position_vols)
         assert full_advantages.shape == (H, N), f"advantages.shape={full_advantages.shape}, expect (H,N)=({H},{N})"
         assert full_weights.shape == (H, N), f"weights.shape={full_weights.shape}, expect (H,N)=({H},{N})"
+
         # ==========================================================
         # 2) Filter: ids != -1
         # ==========================================================
-        valid_mask = (ids != -1) & (th.abs(full_advantages) > 1) #! 这里从0.01改为1，过滤小adv样本，同时看valid_count可以知道目前的策略调整率？（但是1.2的逼近也很慢）
+        valid_mask = ids != -1
         self.valid_count = int(valid_mask.sum().item())
-        if self.valid_count <= 1:
-            print("[Warning] All collected samples are invalid or cold-start (Adv=0). Skipping actor update.")
-            return {
-                "obj_actor_avg": 0.0,
-                "obj_critic_avg": -1.0,
-                "obj_entropy_avg": 0.0,
-                "valid_ratio": 0.0,
-            }
-        #print(full_advantages[:],full_weights[:],valid_mask[:])
+        if self.valid_count == 0:
+            raise ValueError("All collected samples are invalid (all are marked id=-1).")
+
         # ==========================================================
         # 3) Flatten by mask
         # ==========================================================
@@ -207,43 +218,29 @@ class AgentReinforce(AgentBase):
         train_logprobs = logprobs[valid_mask]  # (Total,)
         train_advantages = full_advantages[valid_mask]  # (Total,)
         train_weights = full_weights[valid_mask]  # (Total,)
-        train_ids = ids[valid_mask]  # (Total,)
+        for adv in train_advantages:
+            print(adv,end=" ")
+        print("")
         # Advantage 标准化（只对合法样本）
         #train_advantages = train_advantages / (train_advantages.std() + 1e-8) #! 不能直接对所有验本标准化，应该是所有case的结果标准化，这里一个case有很多步adv都是一样的
         old_std = train_advantages.std().item()
-        # =========================================================
-        # ⚡ 极速分组求均值：彻底消灭 O(N) 的 Python 循环
-        # =========================================================
-        # 1. 获取唯一ID和反向索引（将离散的ID映射为连续的 0 ~ num_unique-1）
-        unique_train_ids, inverse_indices = th.unique(train_ids, return_inverse=True)
-        num_unique = unique_train_ids.numel()
 
-        # 2. 瞬间累加相同 id 的 advantage
-        sum_advs = th.zeros(num_unique, dtype=train_advantages.dtype, device=self.device)
-        sum_advs.scatter_add_(0, inverse_indices, train_advantages)
+        train_ids = ids[valid_mask]  # (Total,)
+        unique_train_ids = train_ids.unique()
+        unique_advs = []
+        for uid in unique_train_ids:
+            id_mask = (train_ids == uid)
+            mean_adv_for_id = train_advantages[id_mask].mean()
+            unique_advs.append(mean_adv_for_id)
+        unique_advs_tensor = th.stack(unique_advs)
+        true_std = unique_advs_tensor.std() + 1
+        train_advantages = train_advantages / true_std
+        print(f"Advantage std before normalization: {old_std:.4f}, after normalization: {true_std:.4f}")
+        print(unique_advs_tensor)
+        
 
-        # 3. 瞬间统计每个 id 包含的样本数
-        counts = th.bincount(inverse_indices).to(self.device).float()
-        #print("Unique cases in batch:", num_unique, "Total valid samples:", self.valid_count)
-        # 4. 向量化相除，得到每个 case 的均值
-        unique_advs_tensor = sum_advs / counts
-        # =========================================================
-
-        if num_unique > 1:
-            true_std = unique_advs_tensor.std() + 1e-8
-            true_mean = unique_advs_tensor.mean()
-        else:
-            true_std = th.tensor(1.0, device=self.device)  # 仅有一个 Case 时防 NaN
-            true_mean = unique_advs_tensor[0] if num_unique == 1 else th.tensor(0.0, device=self.device)
-            
-        true_mean_raw = train_advantages.mean().item()
-
-        #train_advantages = (train_advantages) / (train_advantages.std() + 1e-8)  #! 方法0，直接标准化
-        train_advantages = (train_advantages - true_mean) / true_std #! 方法1，标准化 
-        #train_advantages = th.sign(train_advantages) * th.log1p(th.abs(train_advantages)) #! 方法2，任保留排序但压缩极值
         clean_buffer = (train_states, train_actions, train_logprobs, train_advantages, train_weights)
-        print(f"old std: {old_std:.4f}, ",f"true std: {true_std.item():.4f}, " f"true mean: {true_mean.item():.4f}", f"valid samples: {self.valid_count}")
-        #print(unique_advs_tensor)
+
         # ==========================================================
         # 4) Random Batch 更新
         # ==========================================================
@@ -252,30 +249,15 @@ class AgentReinforce(AgentBase):
 
         th.set_grad_enabled(True)
         update_times = int(max(1, self.valid_count * self.repeat_times / self.batch_size))
-        """for update_t in range(update_times):
+        for update_t in range(update_times):
             obj_actor, obj_entropy = self.update_objectives(clean_buffer, update_t)
             obj_actors.append(obj_actor)
-            obj_entropies.append(obj_entropy)"""
-        for epoch in range(self.repeat_times):
-            shuffled_indices = th.randperm(self.valid_count, device=train_states.device)
-            for start_idx in range(0, self.valid_count, self.batch_size):
-                end_idx = min(start_idx + self.batch_size, self.valid_count)
-                mb_indices = shuffled_indices[start_idx:end_idx]
-                mb_buffer = (
-                    train_states[mb_indices],
-                    train_actions[mb_indices],
-                    train_logprobs[mb_indices],
-                    train_advantages[mb_indices],
-                    train_weights[mb_indices]
-                )
-                #print(epoch, start_idx, end_idx)
-                #print(train_states[mb_indices].shape)
-                obj_actor, obj_entropy = self.update_objectives(mb_buffer,-1)
-                obj_actors.append(obj_actor)
-                obj_entropies.append(obj_entropy)
+            obj_entropies.append(obj_entropy)
         th.set_grad_enabled(False)
+
         obj_entropy_avg = float(np.mean(obj_entropies)) if obj_entropies else 0.0
         obj_actor_avg = float(np.mean(obj_actors)) if obj_actors else 0.0
+
         return {
             "obj_actor_avg": obj_actor_avg,
             "obj_critic_avg": -1.0,
@@ -283,21 +265,37 @@ class AgentReinforce(AgentBase):
             "valid_ratio": self.valid_count / (H * N),
         }
 
-    def update_objectives(self, mb_buffer: Tuple[TEN, ...], update_t: int) -> Tuple[float, float]:
-        mb_states, mb_actions, mb_old_logprobs, mb_advantages, mb_weights = mb_buffer
-        new_logprobs, entropy = self.act.get_logprob_entropy(mb_states, mb_actions)
+    def update_objectives(self, clean_buffer: Tuple[TEN, ...], update_t: int) -> Tuple[float, ...]:
+        """
+        简单的随机 Batch 采样更新
+        """
+        states, actions, old_logprobs, advantages, weights = clean_buffer
+        assert self.valid_count == states.shape[0]
+
+        # 直接在 [0, total_valid) 范围内随机抽样
+        indices = th.randint(self.valid_count, size=(self.batch_size,), device=self.device)
+
+        mb_states = states[indices]
+        mb_actions = actions[indices]
+        mb_old_logprobs = old_logprobs[indices]
+        mb_advantages = advantages[indices]
+        mb_weights = weights[indices]
+
+        # PPO 计算逻辑
+        new_logprobs, entropy = self.act.get_logprob_entropy(mb_states, mb_actions) #! 向量化的完成
+
         ratio = (new_logprobs - mb_old_logprobs).exp()
         surr1 = ratio * mb_advantages
         surr2 = ratio.clamp(1 - self.ratio_clip_lower, 1 + self.ratio_clip_upper) * mb_advantages
 
         obj_entropy = entropy.mean()
-        
-        # 结合资金量权重的 Actor Loss
         loss_actor = -(th.min(surr1, surr2) * mb_weights).mean()
         loss_actor = loss_actor - self.lambda_entropy * obj_entropy
-        
+
+        # print(loss_actor.item(), "and",obj_entropy.item())
         self.optimizer_backward(self.act_optimizer, loss_actor)
-        return loss_actor.item(), obj_entropy.item()
+
+        return (loss_actor.item(), obj_entropy.item())
 
     def get_advantages(
         self,
@@ -353,29 +351,19 @@ class AgentReinforce(AgentBase):
         # ======================================================
         # Step 3: Baseline & Advantage
         # ======================================================
-        ids_flat = ids.view(-1)
-        G_flat_1d = G_flat.view(-1)
+        Baselines = th.zeros_like(G_flat)
 
-        unique_ids, inverse_indices = th.unique(ids_flat, return_inverse=True)
-        num_unique = unique_ids.numel()
-
-        sum_g = th.zeros(num_unique, dtype=G_flat.dtype, device=self.device)
-        sum_g.scatter_add_(0, inverse_indices, G_flat_1d)
-        counts = th.bincount(inverse_indices).float()
-        mean_g = sum_g / counts
-
-        b_vals = th.zeros(num_unique, dtype=G_flat.dtype, device=self.device)
-        unique_ids_list = unique_ids.tolist()
-        mean_g_list = mean_g.tolist()
-
-        for i in range(num_unique):
-            uid_val = unique_ids_list[i]
+        unique_ids = ids.unique()
+        for uid in unique_ids:
+            uid_val = int(uid.item())
+            id_mask = ids == uid
 
             # id=-1：baseline=0，不更新 EMA
             if uid_val == -1:
+                Baselines[id_mask] = 0.0
                 continue
 
-            current_r_val = mean_g_list[i]
+            current_r_val = float(G_flat[id_mask].mean().item())
 
             if uid_val not in self.baseline_ema:
                 b_val = current_r_val
@@ -384,20 +372,13 @@ class AgentReinforce(AgentBase):
                 b_val = float(self.baseline_ema[uid_val])
 
             #! b_val = float(self.baseline_ema.get(uid_val, 0.0))
-            b_vals[i] = b_val
+            Baselines[id_mask] = b_val
 
             # 先用旧 b_val 算 adv，再更新 baseline（符合你“先减历史 base”）
             self.baseline_ema[uid_val] = (1.0 - self.baseline_alpha) * b_val + self.baseline_alpha * current_r_val
 
-        Baselines = b_vals[inverse_indices].view(horizon_len, num_seq)
         Advantages = G_flat - Baselines
-        """valid_advs = Advantages
-        if valid_advs.numel() > 0:
-            lower_bound = th.quantile(valid_advs, 0.01)
-            upper_bound = th.quantile(valid_advs, 0.99)
-            Advantages = th.clamp(Advantages, min=lower_bound, max=upper_bound)"""
-        #m2
-        #Advantages = th.sign(Advantages) * th.sqrt(th.abs(Advantages))
+
         # ======================================================
         # Step 4: Weights
         # ======================================================
@@ -425,74 +406,7 @@ class AgentReinforce(AgentBase):
 # ==============================================================================
 # Customized Actor
 # ==============================================================================
-import numpy as np
-import numba as nb
 
-@nb.njit(fastmath=True, cache=True)
-def _numba_get_action_and_logprob(logits: np.ndarray, temp: float, greedy_eps: float) -> Tuple[int, float]:
-    dim = logits.shape[0]
-    
-    # ==========================================
-    # 第一部分：带温度的采样 (Behavior)
-    # ==========================================
-    max_val_sample = -1e9
-    scaled = np.empty(dim, dtype=np.float32)
-    for i in range(dim):
-        v = logits[i]
-        if v < -5.0: v = -5.0
-        elif v > 5.0: v = 5.0 #! 对clamp 阻断了梯度传播？，但这里只会是采样所以没关系，就应该clamp
-        v = v / temp  # ⚡ 施加温度
-        scaled[i] = v
-        if v > max_val_sample:
-            max_val_sample = v
-            
-    sum_exp_sample = 0.0
-    for i in range(dim):
-        e = np.exp(scaled[i] - max_val_sample)
-        scaled[i] = e
-        sum_exp_sample += e
-        
-    greedy_mul = 1.0 - greedy_eps
-    greedy_add = greedy_eps / dim
-    
-    rand_val = np.random.random()
-    cdf = 0.0
-    action = dim - 1  
-    
-    for i in range(dim):
-        p = (scaled[i] / sum_exp_sample) * greedy_mul + greedy_add
-        cdf += p
-        if action == dim - 1 and rand_val <= cdf:
-            action = i
-
-    # ==========================================
-    # 第二部分：纯净的概率计算 (Base/Target)
-    # 彻底无视刚才的 temp 和 eps，直接用原始 logits 算 action 的概率！
-    # ==========================================
-    max_val_base = -1e9
-    for i in range(dim):
-        v = logits[i]
-        if v < -5.0: v = -5.0
-        elif v > 5.0: v = 5.0
-        if v > max_val_base:
-            max_val_base = v
-            
-    sum_exp_base = 0.0
-    action_exp = 0.0
-    for i in range(dim):
-        v = logits[i]
-        if v < -5.0: v = -5.0
-        elif v > 5.0: v = 5.0
-        e = np.exp(v - max_val_base)
-        sum_exp_base += e
-        if i == action:
-            action_exp = e
-            
-    # 算出本体的纯净 logprob 返回给 Buffer
-    base_prob = action_exp / sum_exp_base
-    logprob = np.log(base_prob + 1e-8)
-    
-    return action, logprob
 
 class ActorDiscreteReinforce(ActorBase):
     def __init__(self, state_dim: int, action_dim: int, cfg: DictConfig):
@@ -501,57 +415,40 @@ class ActorDiscreteReinforce(ActorBase):
         self.net = build_mlp(dims=[state_dim, *cfg.mlp_args.net_dims, action_dim], dropout_p=dropout_p)
         layer_init_with_orthogonal(self.net[-1], std=0.5)
         self.ActionDist: type[th.distributions.Categorical] = th.distributions.Categorical
-        self.onnx_session = cfg.onnx_session
+        self.greedy_eps: float = cfg.greedy_eps
+        self.temp_tau: float = cfg.temp_tau
         #! self.K = cfg.需要K和padding0
-   
-    def _probs(self, state: TEN, temperature: float, greedy_eps: float ) -> TEN:
+
+    def _probs(self, state: TEN, temperature: Optional[float] = None) -> TEN:
         logits = self.net(state)
-        #a_prob = th.softmax(th.clamp(logits, -5.0, 5.0) / temperature, dim=-1)#! 这里clamp的含义是完全不管那些大的，不合理，不是原以为的更大的收束到5
-        a_prob = th.softmax(logits / temperature, dim=-1)
-        if greedy_eps > 0.0:
-            a_prob = a_prob * (1.0 - greedy_eps) + greedy_eps / self.action_dim
-        if random.random() < 0.000001:  #! debug
+        assert temperature == self.temp_tau, f"Temperature {temperature} must equal Actor's temp_tau {self.temp_tau} for consistent exploration behavior. Got {temperature} != {self.temp_tau}."
+        tau = temperature
+        a_prob = th.softmax(th.clamp(logits, -5.0, 5.0) / tau, dim=-1)
+        if self.greedy_eps > 0.0:
+            a_prob = (1.0 - self.greedy_eps) * a_prob + self.greedy_eps * (1.0 / self.action_dim)
+        if random.random() < 0.0000006:  #! debug
             print("temperature: ", temperature)
             print("[action_prob]", logits, "->", a_prob)
         return a_prob
 
-    def forward(self, state: TEN) -> TEN: #! eval的时候用这个
+    def forward(self, state: TEN) -> TEN: # 这个是真正评估推理
         return self.net(state).argmax(dim=-1)
         #return self._probs(state, temperature=1.0).argmax(dim=-1)
 
-    def get_action(self, state: TEN, temperature: float, greedy_eps: float) -> Tuple[TEN, TEN]: # 这个是用来rollout探索的
-        if self.onnx_session:
-            state_np = state.cpu().numpy()#.astype(np.float32)
-            if state_np.ndim == 1:
-                state_np = state_np.reshape(1, -1)
-                
-            logits_np = self.onnx_session.run(None, {'state': state_np})[0].reshape(-1) # 确保展平为 1D
-            action_np, logprob_np = _numba_get_action_and_logprob(logits_np, temperature, greedy_eps)
-            
-            action = th.as_tensor(action_np, dtype=th.int64, device=state.device)
-            logprob = th.as_tensor(logprob_np, dtype=th.float32, device=state.device)
-            return action, logprob
-        else:
-            a_prob_sample = self._probs(state, temperature, greedy_eps)
-            action = th.multinomial(a_prob_sample, 1).squeeze(-1)
-            a_prob_base = self._probs(state, temperature=1.0, greedy_eps=0.0)
-            selected_prob = a_prob_base.gather(-1, action.unsqueeze(-1)).squeeze(-1)
-            logprob = th.log(selected_prob + 1e-8)
-           
-            return action, logprob
-
-    def get_logprob_entropy(self, state: TEN, action: TEN) -> Tuple[TEN, TEN]: #! 在训练learner时候调用，且是一个batch的计算，所以这里的state和action都是batch的
-        #! 这个函数和rollout都调用_probs得到结果，一些随机化的操作的可以在这个函数里绑定，就不用额外记是怎么随机化了（针对important sampling的logprob计算，必须保证和探索的时候的temperature一致）
-        a_prob = self._probs(state, temperature=1.0,greedy_eps=0.0) #! 在计算概率的时候始终按照原始概率，仅仅是采样的时候用temperature和greedy_eps来调整采样行为，这样保证了重要性采样的正确性（因为logprob计算必须基于原始概率分布）。如果在这里也应用temperature和greedy_eps，那么计算出来的logprob就不再是原始分布下的概率了，重要性采样的权重就会出问题。
-        """dist = self.ActionDist(probs=a_prob)
+    def get_action(self, state: TEN, temperature: float = 1.0) -> Tuple[TEN, TEN]: # 这个是用来探索的
+        a_prob = self._probs(state, temperature=temperature)
+        dist = self.ActionDist(probs=a_prob)
+        action = dist.sample()
         logprob = dist.log_prob(action)
-        entropy = dist.entropy()"""
-        action_long = action.long()
-        selected_prob = a_prob.gather(-1, action_long.unsqueeze(-1)).squeeze(-1)
-        logprob = th.log(selected_prob + 1e-8)
-        entropy = -(a_prob * th.log(a_prob + 1e-8)).sum(dim=-1)
+        return action, logprob
+
+    def get_logprob_entropy(self, state: TEN, action: TEN) -> Tuple[TEN, TEN]:
+        a_prob = self._probs(state, temperature=self.temp_tau) #! 这里很危险，必须保证和探索的时候的temperature一致，所以如果使用了周期性温度调度，这里也必须使用周期性温度调度的当前值，不能直接写死一个数值！
+        dist = self.ActionDist(probs=a_prob)
+        logprob = dist.log_prob(action)
+        entropy = dist.entropy()
         return logprob, entropy
-    
+
     @staticmethod
     def convert_action_for_env(action: TEN) -> TEN:
         return action.long()

@@ -252,27 +252,10 @@ class AgentReinforce(AgentBase):
 
         th.set_grad_enabled(True)
         update_times = int(max(1, self.valid_count * self.repeat_times / self.batch_size))
-        """for update_t in range(update_times):
+        for update_t in range(update_times):
             obj_actor, obj_entropy = self.update_objectives(clean_buffer, update_t)
             obj_actors.append(obj_actor)
-            obj_entropies.append(obj_entropy)"""
-        for epoch in range(self.repeat_times):
-            shuffled_indices = th.randperm(self.valid_count, device=train_states.device)
-            for start_idx in range(0, self.valid_count, self.batch_size):
-                end_idx = min(start_idx + self.batch_size, self.valid_count)
-                mb_indices = shuffled_indices[start_idx:end_idx]
-                mb_buffer = (
-                    train_states[mb_indices],
-                    train_actions[mb_indices],
-                    train_logprobs[mb_indices],
-                    train_advantages[mb_indices],
-                    train_weights[mb_indices]
-                )
-                #print(epoch, start_idx, end_idx)
-                #print(train_states[mb_indices].shape)
-                obj_actor, obj_entropy = self.update_objectives(mb_buffer,-1)
-                obj_actors.append(obj_actor)
-                obj_entropies.append(obj_entropy)
+            obj_entropies.append(obj_entropy)
         th.set_grad_enabled(False)
         obj_entropy_avg = float(np.mean(obj_entropies)) if obj_entropies else 0.0
         obj_actor_avg = float(np.mean(obj_actors)) if obj_actors else 0.0
@@ -283,21 +266,32 @@ class AgentReinforce(AgentBase):
             "valid_ratio": self.valid_count / (H * N),
         }
 
-    def update_objectives(self, mb_buffer: Tuple[TEN, ...], update_t: int) -> Tuple[float, float]:
-        mb_states, mb_actions, mb_old_logprobs, mb_advantages, mb_weights = mb_buffer
-        new_logprobs, entropy = self.act.get_logprob_entropy(mb_states, mb_actions)
+    def update_objectives(self, clean_buffer: Tuple[TEN, ...], update_t: int) -> Tuple[float, ...]:
+        """
+        简单的随机 Batch 采样更新
+        """
+        states, actions, old_logprobs, advantages, weights = clean_buffer
+        assert self.valid_count == states.shape[0]
+        # 直接在 [0, total_valid) 范围内随机抽样
+        indices = th.randint(self.valid_count, size=(self.batch_size,), device=self.device)
+
+        mb_states = states[indices]
+        mb_actions = actions[indices]
+        mb_old_logprobs = old_logprobs[indices]
+        mb_advantages = advantages[indices]
+        mb_weights = weights[indices]
+        # PPO 计算逻辑
+        new_logprobs, entropy = self.act.get_logprob_entropy(mb_states, mb_actions) #! 向量化的完成
         ratio = (new_logprobs - mb_old_logprobs).exp()
         surr1 = ratio * mb_advantages
         surr2 = ratio.clamp(1 - self.ratio_clip_lower, 1 + self.ratio_clip_upper) * mb_advantages
 
         obj_entropy = entropy.mean()
-        
-        # 结合资金量权重的 Actor Loss
         loss_actor = -(th.min(surr1, surr2) * mb_weights).mean()
         loss_actor = loss_actor - self.lambda_entropy * obj_entropy
-        
+        # print(loss_actor.item(), "and",obj_entropy.item())
         self.optimizer_backward(self.act_optimizer, loss_actor)
-        return loss_actor.item(), obj_entropy.item()
+        return (loss_actor.item(), obj_entropy.item())
 
     def get_advantages(
         self,

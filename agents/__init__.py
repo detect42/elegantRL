@@ -2,6 +2,7 @@ from .AgentBase import AgentBase
 from .AgentModSACDiscrete import AgentModSACDiscrete
 from .AgentPPO import AgentPPO, AgentDiscretePPO
 from .AgentReinforce import AgentReinforce
+from .AgentGRPO import AgentGRPO
 """
 # DQN (off-policy)
 from .AgentDQN import AgentDQN, AgentDuelingDQN

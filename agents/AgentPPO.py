@@ -38,7 +38,7 @@ class AgentPPO(AgentBase):
 
         self.if_use_v_trace = args.agent.if_use_v_trace  # GAE or V-trace
 
-    def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN, TEN]:
+    def _explore_one_env(self, env, horizon_len: int, task_config: Optional[Dict] = None) -> Tuple[TEN, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **single** environment instance.
 
@@ -95,7 +95,7 @@ class AgentPPO(AgentBase):
         unmasks = th.logical_not(truncates).view((horizon_len, 1))
         return states, actions, logprobs, rewards, undones, unmasks
 
-    def _explore_vec_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN, TEN]:
+    def _explore_vec_env(self, env, horizon_len: int, task_config: Optional[Dict] = None) -> Tuple[TEN, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **vectorized** environment instance.
 
@@ -159,8 +159,9 @@ class AgentPPO(AgentBase):
             advantages = self.get_advantages(states, rewards, undones, unmasks, values)  # shape == (buffer_size, )
             reward_sums = advantages + values  # reward_sums.shape == (buffer_size, )
             del rewards, undones, values
-
+            print("adv_mean:", advantages.mean().item(), "adv_std:", advantages.std().item(), flush=True)  #! debug
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)  # avoid CUDA OOM
+            
             assert logprobs.shape == advantages.shape == reward_sums.shape == (buffer_size, states.shape[1])
         buffer = states, actions, unmasks, logprobs, advantages, reward_sums
 
@@ -329,8 +330,150 @@ class ActorPPO(ActorBase):
         # return 0.04*(action.tanh()+1)
         return action.tanh()
 
+import numpy as np
+import numba as nb
+
+@nb.njit(fastmath=True, cache=True)
+def _numba_get_action_and_logprob(logits: np.ndarray, temp: float, greedy_eps: float) -> Tuple[int, float]:
+    dim = logits.shape[0]
+    
+    # 1. 熔合操作：Clamp + 缩放 + 寻找最大值 (为 Softmax 准备)
+    max_val = -1e9
+    scaled = np.empty(dim, dtype=np.float32)
+    for i in range(dim):
+        v = logits[i]
+        if v < -5.0: v = -5.0
+        elif v > 5.0: v = 5.0
+        v = v / temp
+        scaled[i] = v
+        if v > max_val:
+            max_val = v
+            
+    # 2. 熔合操作：Exp 与 求和
+    sum_exp = 0.0
+    for i in range(dim):
+        e = np.exp(scaled[i] - max_val)
+        scaled[i] = e
+        sum_exp += e
+        
+    # 3. 熔合操作：计算最终概率 + CDF (累积分布) 极速采样
+    greedy_mul = 1.0 - greedy_eps
+    greedy_add = greedy_eps / dim
+    
+    rand_val = np.random.random()
+    cdf = 0.0
+    action = dim - 1  # 兜底动作
+    
+    for i in range(dim):
+        # 算出当前动作最终的概率
+        p = (scaled[i] / sum_exp) * greedy_mul + greedy_add
+        scaled[i] = p  # 原地存回，供算 logprob 用
+        cdf += p
+        
+        # 轮盘赌采样：随机数命中 CDF 区间
+        if action == dim - 1 and rand_val <= cdf:
+            action = i
+            
+    # 4. 计算选中动作的对数概率
+    logprob = np.log(scaled[action] + 1e-8)
+    
+    return action, logprob
 
 class ActorDiscretePPO(ActorPPO):
+    def __init__(self, state_dim: int, action_dim: int, cfg: DictConfig):
+        """
+        离散速率策略。引入了与 REINFORCE 相同的极致加速方案：
+        - 移除 Categorical 依赖
+        - 支持 ONNX + Numba 极速采样
+        - 纯张量向量化计算 Logprob 和 Entropy
+        """
+        super().__init__(state_dim=state_dim, action_dim=action_dim, cfg=cfg)
+
+        # ★ 连续版里无用的高斯参数，删除以免被优化器更新
+        if hasattr(self, "action_std_log"):
+            del self.action_std_log
+
+        # self.ActionDist = th.distributions.Categorical  # 不再需要了
+        
+        # ★ 止塌与温度超参
+        self.greedy_eps: float = cfg.greedy_eps
+        self.temp_tau: float = cfg.temp_tau
+        self._greedy_mul = 1.0 - self.greedy_eps
+        self._greedy_add = self.greedy_eps / self.action_dim
+        
+        # ★ ONNX 会话支持
+        self.onnx_session = cfg.onnx_session
+
+    def _probs(self, state: TEN, temperature: Optional[float] = None) -> TEN:
+        """纯张量计算动作概率，带温度缩放与 epsilon-greedy 混合"""
+        if temperature is None:
+            temperature = self.temp_tau
+            
+        # 经过状态归一化（如有）并过网络
+        logits = self.net(self.state_norm(state))  
+        
+        # 温度缩放与极值截断
+        tau = max(float(temperature), 1e-6)
+        a_prob = th.softmax(th.clamp(logits, -5.0, 5.0) / tau, dim=-1)
+
+        # epsilon-greedy 混合防坍塌
+        if self.greedy_eps > 0.0:
+            a_prob = a_prob * self._greedy_mul + self._greedy_add
+
+        return a_prob
+
+    def forward(self, state: TEN) -> TEN:
+        """推理：返回离散动作最大概率索引（argmax）"""
+        return self.net(self.state_norm(state)).argmax(dim=-1)
+
+    def get_action(self, state: TEN, temperature: Optional[float] = None) -> tuple[TEN, TEN]:
+        """训练探索采样：支持 ONNX+Numba 极速单核采样，或 GPU 向量化采样"""
+        if self.onnx_session:
+            # ==== 1. ONNX + Numba 极速分支 ====
+            state_np = state.cpu().numpy()
+            if state_np.ndim == 1:
+                state_np = state_np.reshape(1, -1)
+                
+            logits_np = self.onnx_session.run(None, {'state': state_np})[0].reshape(-1)
+            
+            # 使用 temp_tau 或者传入的 temperature
+            temp = temperature if temperature is not None else self.temp_tau
+            action_np, logprob_np = _numba_get_action_and_logprob(logits_np, temp, self.greedy_eps)
+            
+            # ⚡ 修复核心：给标量套上 []，强制生成 (1,) 的 1 维张量，完美匹配 AgentPPO 的 t[0] 解包！
+            action = th.as_tensor([action_np], dtype=th.int64, device=state.device)
+            logprob = th.as_tensor([logprob_np], dtype=th.float32, device=state.device)
+            return action, logprob
+        else:
+            # ==== 2. PyTorch 纯张量极速分支 ====
+            a_prob = self._probs(state, temperature=temperature)
+            
+            action = th.multinomial(a_prob, 1).squeeze(-1)  # 产出 (1,)
+            selected_prob = a_prob.gather(-1, action.unsqueeze(-1)).squeeze(-1)
+            logprob = th.log(selected_prob + 1e-8)  # 产出 (1,)
+            
+            return action, logprob
+
+    def get_logprob_entropy(self, state: TEN, action: TEN) -> tuple[TEN, TEN]:
+        """训练更新计算：在 Learner 的 GPU 上计算全 Batch 的 Logprob 和 Entropy"""
+        # 注意：这里强制使用模型的 temp_tau，以对齐探索时的概率分布
+        a_prob = self._probs(state, temperature=self.temp_tau) 
+        
+        # 1. 向量化提取 Logprob
+        action_long = action.long()
+        selected_prob = a_prob.gather(-1, action_long.unsqueeze(-1)).squeeze(-1)
+        logprob = th.log(selected_prob + 1e-8)
+        
+        # 2. 向量化手撕 Entropy 公式：-sum(p * log(p))
+        entropy = -(a_prob * th.log(a_prob + 1e-8)).sum(dim=-1)
+        
+        return logprob, entropy
+
+    @staticmethod
+    def convert_action_for_env(action: TEN) -> TEN:
+        return action.long()
+    
+class ActorDiscretePPO_old(ActorPPO):
     ActionDist: type[th.distributions.Categorical]  # type: ignore[assignment]
 
     def __init__(self, state_dim: int, action_dim: int, cfg: DictConfig):

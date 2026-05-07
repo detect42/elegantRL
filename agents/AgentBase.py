@@ -4,7 +4,7 @@ import numpy as np
 import torch as th
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
-from typing import Union, Optional
+from typing import Any, Dict, Union, Optional
 import random
 from torch.distributions import Distribution
 import torch.nn.functional as F
@@ -66,21 +66,22 @@ class AgentBase:
         """save and load"""
         self.save_attr_names = {"act", "act_target", "act_optimizer", "cri", "cri_target", "cri_optimizer"}
 
-    def explore_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
+    def explore_env(self, env, horizon_len: int,task_config: Dict[str, Any]) -> tuple[TEN, ...]:
         if self.if_vec_env:
-            return self._explore_vec_env(env=env, horizon_len=horizon_len)
+            return self._explore_vec_env(env=env, horizon_len=horizon_len, task_config=task_config)
         else:
-            return self._explore_one_env(env=env, horizon_len=horizon_len)
+            return self._explore_one_env(env=env, horizon_len=horizon_len, task_config=task_config)
 
     def explore_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]:  #! action or (action,logprob)
         return self.act.get_action(state)  #! agentbase里没有定义get_action方法
 
-    def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
+    def _explore_one_env(self, env, horizon_len: int, task_config: Dict[str, Any]) -> tuple[TEN, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **single** environment instance.
 
         env: RL training environment. env.reset() env.step(). It should be a vector env.
         horizon_len: collect horizon_len step while exploring to update networks
+        task_config: configuration for the exploration task
         return: `(states, actions, rewards, undones, unmasks)` for off-policy
             `num_envs == 1`
             `states.shape == (horizon_len, num_envs, state_dim)`
@@ -131,7 +132,6 @@ class AgentBase:
         self.last_state = state  # state.shape == (1, state_dim) for a single env.
         """add dim1=1 below for workers buffer_items concat"""
         states = states.view((horizon_len, 1, self.state_dim))
-        actions = actions.view((horizon_len, 1, self.action_dim if not self.if_discrete else 1))
         actions = (
             actions.view((horizon_len, 1, self.action_dim)) if not self.if_discrete else actions.view((horizon_len, 1))
         )
@@ -140,12 +140,13 @@ class AgentBase:
         unmasks = th.logical_not(truncates).view((horizon_len, 1))
         return states, actions, rewards, undones, unmasks
 
-    def _explore_vec_env(self, env, horizon_len: int) -> tuple[TEN, ...]:
+    def _explore_vec_env(self, env, horizon_len: int, task_config: Dict[str, Any]) -> tuple[TEN, ...]:
         """
         Collect trajectories through the actor-environment interaction for a **vectorized** environment instance.
 
         env: RL training environment. env.reset() env.step(). It should be a vector env.
         horizon_len: collect horizon_len step while exploring to update networks
+        task_config: configuration for the exploration task
         return: `(states, actions, rewards, undones, unmasks)` for off-policy
             `num_envs > 1`
             `states.shape == (horizon_len, num_envs, state_dim)`
@@ -338,13 +339,13 @@ class ActorBase(nn.Module, ABC):
         self.action_dim = action_dim
         self.ActionDist: type[Distribution] = th.distributions.normal.Normal
 
-    @abstractmethod
+    """@abstractmethod
     def get_action(self, state: TEN) -> Union[TEN, tuple[TEN, TEN]]:
         pass
 
     def forward(self, state: TEN) -> TEN:
         action = self.net(state)
-        return action.tanh()
+        return action.tanh()"""
 
 
 class CriticBase(nn.Module, ABC):

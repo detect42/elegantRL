@@ -1,7 +1,9 @@
+import math
 import os
 import time
 import numpy as np
 import torch as th
+import random
 import multiprocessing as mp
 from copy import deepcopy
 from typing import Any, List, Optional, Tuple, cast, Union
@@ -26,10 +28,10 @@ if os.name == "nt":  # if is WindowOS (Windows NT)
 
 def train_agent(args: DictConfig, if_single_process: bool = False):
     if if_single_process:
-        print(f"| train_agent_single_process() with GPU_ID {args.sys.gpu_id}", flush=True)
+        print(f"| train_agent_single_process() with GPU_ID {args.sys.learner_gpu_id}", flush=True)
         train_agent_single_process(args)
     elif len(args.sys.learner_gpu_ids) == 0:
-        print(f"| train_agent_multiprocessing() with GPU_ID {args.sys.gpu_id}", flush=True)
+        print(f"| train_agent_multiprocessing() with GPU_ID {args.sys.learner_gpu_id}", flush=True)
         train_agent_multiprocessing(args)
     elif len(args.sys.learner_gpu_ids) != 0:
         print(f"| train_agent_multiprocessing_multi_gpu() with GPU_ID {args.sys.learner_gpu_ids}", flush=True)
@@ -53,7 +55,7 @@ def train_agent_single_process(args: DictConfig):
         agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
     """init agent.last_state"""
-    state, info_dict = env.reset()
+    state, info_dict = env.reset(mode="train")
     if args.env.num_envs == 1:
         assert state.shape == (args.env.state_dim,)
         assert isinstance(state, np.ndarray)
@@ -239,7 +241,7 @@ class Learner(Process):
         th.set_grad_enabled(False)
 
         """COMMUNICATE between Learners: init"""
-        learner_id = args.sys.learner_gpu_ids.index(args.sys.gpu_id) if len(args.sys.learner_gpu_ids) > 0 else 0
+        learner_id = args.sys.learner_gpu_ids.index(args.sys.learner_gpu_id) if len(args.sys.learner_gpu_ids) > 0 else 0
         num_learners = max(1, len(args.sys.learner_gpu_ids))
         num_communications = num_learners - 1
         if len(args.sys.learner_gpu_ids) >= 2:
@@ -251,12 +253,12 @@ class Learner(Process):
 
         """Learner init agent"""
         # agent_class = get_class_from_path(args.agent.agent_name)
-        # agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+        # agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.learner_gpu_id, args=args)
         agent_class = get_class(args.agent._target_)
         agent = agent_class(
             state_dim=args.env.state_dim,
             action_dim=args.env.action_dim,
-            gpu_id=args.sys.gpu_id,
+            gpu_id=args.sys.learner_gpu_id,
             args=args,
         )
         if args.train.continue_train:
@@ -267,9 +269,9 @@ class Learner(Process):
         """Learner init buffer"""
         if if_off_policy:
             buffer = ReplayBuffer(
-                gpu_id=args.sys.gpu_id,
+                gpu_id=args.sys.learner_gpu_id,
                 num_seqs=args.env.num_envs * args.sys.num_workers * num_learners,
-                max_size=args.train.buffer_size,
+                max_size=args.train.buffer_size, #! 这里的buffersize不包含num_worker并行的部分
                 state_dim=args.env.state_dim,
                 action_dim=1 if args.env.if_discrete else args.env.action_dim,
                 if_use_per=args.train.if_use_per,
@@ -312,21 +314,61 @@ class Learner(Process):
             logprobs = th.zeros((horizon_len, num_seqs), dtype=th.float32, device=agent.device)
             buffer_list.append(logprobs)
         buffer_list.extend([rewards, undones, unmasks])
-        if mode == "multicase":
+        if mode == "multicase" or mode == "grpo":
             ids = th.zeros((horizon_len, num_seqs), dtype=th.long, device=agent.device)
             target_position_vols = th.zeros((horizon_len, num_seqs), dtype=th.float32, device=agent.device)
             buffer_list.extend([ids, target_position_vols])
+            # buffer_items_tensor = (states, actions, logprobs, rewards, undones, unmasks, ids, target_position_vols)  # on-policy
         buffer_items_tensor = tuple(buffer_list)
 
         accumulated_steps = 0
         if_train = True
+        last_valid_ratio = 1.0
         while if_train:
-            actor = agent.act
-            actor = deepcopy(actor).cpu() if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
+            actor_cpu = deepcopy(agent.act).cpu()
+            time_worker_begin = time.time()
+            task_configs = []
+            if mode == "grpo":
+                # GRPO 分组：6个组，每组8人
+                group_size = self.args.agent.group_size
+                G = num_workers // group_size
+                group_seeds = [random.randint(0, 9999999) for _ in range(G)]
+                
+                tau_min = self.args.agent.grpo_tau_min
+                tau_max = self.args.agent.grpo_tau_max
+                eps_min = self.args.agent.grpo_eps_min
+                eps_max = self.args.agent.grpo_eps_max
+
+                #! adptive tau_max 注意这里细节使用温度而非noise，因为一次随机的take对影响太致命了，在目前env不合适。如果是老env按速率应该是ok的
+                """if last_valid_ratio < 0.6:
+                   tau_max = min(tau_max+0.1,10)
+                else:
+                    tau_max = self.args.agent.grpo_tau_max
+                print(tau_max)"""
+                for w_id in range(num_workers):
+                    group_id = w_id // group_size
+                    intra_id = w_id % group_size
+
+                    ratio =  intra_id / (group_size - 1) if group_size > 1 else 0.0
+                    tau = tau_min + (tau_max - tau_min) * ratio
+                    eps = eps_min + (eps_max - eps_min) * ratio
+                        
+                    task_configs.append({
+                        "group_seed": group_seeds[group_id],
+                        "temperature": tau,
+                        "greedy_eps": eps
+                    })
+            else:
+                # 普通 Reinforce / PPO 的单一同质化配置
+                tau = self.args.agent.train_temp_tau
+                greedy_eps = self.args.agent.train_greedy_eps
+                task_configs = [{"temperature": tau, "greedy_eps": greedy_eps} for _ in range(num_workers)]
+
+
 
             """Learner send actor to Workers"""
-            for send_pipe in self.send_pipes:
-                send_pipe.send(actor)
+            for w_id, send_pipe in enumerate(self.send_pipes):
+                send_pipe.send((actor_cpu, task_configs[w_id]))
             """Learner receive (buffer_items, last_state) from Workers"""
             for _ in range(num_workers):
                 worker_id, buffer_items, last_state = self.recv_pipe.recv()
@@ -337,7 +379,8 @@ class Learner(Process):
                     buffer_tensor[:, buf_i:buf_j] = buffer_item.to(agent.device)
                 agent.last_state[buf_i:buf_j] = last_state.to(agent.device)
             del buffer_items, last_state
-
+            #?
+            print(f"| Worker Explore Time: {time.time() - time_worker_begin:.3f}s", flush=True)
             """COMMUNICATE between Learners: Learner send actor to other Learners"""
             _buffer_len = num_envs * num_workers
             _buffer_items_tensor = [t[:, :_buffer_len].cpu().detach() for t in buffer_items_tensor]
@@ -359,7 +402,7 @@ class Learner(Process):
             if if_off_policy:
                 buffer.update(buffer_items_tensor)
             else:
-                buffer[:] = buffer_items_tensor
+                buffer[:] = buffer_items_tensor #! 这里对于PPO/reinforce这种，没有利用其历史数据（算importance sampling来无偏）
 
             if if_discrete:
                 # 1. 扁平化 actions 并在 GPU 上转为 long 类型
@@ -376,12 +419,15 @@ class Learner(Process):
                 show_str = str([f"{p}%" for p in pcts]).replace("'", "")
             else:
                 show_str = ""
+            time_learner_begin = time.time()
             """Learner update network using training data"""
             th.set_grad_enabled(True)
-            logging_dict = agent.update_net(buffer)
+            logging_dict = agent.update_net(buffer) #! RL algorithm 更新网络
+            last_valid_ratio = logging_dict["valid_ratio"]
             logging_dict = {**logging_dict, "action_show_str": show_str}
             th.set_grad_enabled(False)
-
+            #?
+            print(f"| Learner Update Time: {time.time() - time_learner_begin:.3f}s", flush=True)
             if if_off_policy:
                 exp_r = (
                     buffer_items_tensor[2].mean().item()
@@ -393,7 +439,8 @@ class Learner(Process):
             """Learner receive training signal from Evaluator"""
             if self.eval_pipe.poll():  # whether there is any data available to be read of this pipe0
                 if_train = self.eval_pipe.recv()  # True means evaluator in idle moments.
-                self.eval_pipe.send((actor, accumulated_steps, exp_r, logging_dict))
+                #! actor_cpu = deepcopy(agent.act).cpu() 这里应该先这个，但是为了看初始的情况，先不这样
+                self.eval_pipe.send((actor_cpu, accumulated_steps, exp_r, logging_dict))
                 print(logging_dict)
                 accumulated_steps = 0
             else:
@@ -414,7 +461,6 @@ class Learner(Process):
             print(f"| LearnerPipe.run: ReplayBuffer saved  in {cwd}", flush=True)
         print("| Learner Closed", flush=True)
 
-
 class Worker(Process):
     def __init__(
         self,
@@ -427,27 +473,33 @@ class Worker(Process):
         self.recv_pipe = worker_pipe[0]
         self.send_pipe = learner_pipe[1]
         self.worker_id = worker_id
+        self.cum_step = 0
         self.args = args
+        self.random_seed = args.sys.random_seed + worker_id  # 每个 Worker 不同的随机种子，保证实验可复现
+        self.step_num = args.train.horizon_len * args.sys.num_workers * args.env.num_envs
 
     def run(self):
         args = self.args
         worker_id = self.worker_id
         th.set_grad_enabled(False)
-
+        random.seed(self.random_seed)
+        np.random.seed(self.random_seed)
+        th.manual_seed(self.random_seed)
         """init environment"""
         env_class = get_class(args.env._target_)
         # print(env_class)
-        env = build_env(env_class, args.env, args.sys.gpu_id)
+        
+        env = build_env(env_class, args.env, args.sys.worker_gpu_id)
 
         """init agent"""
         agent_class = get_class(args.agent._target_)
-        agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.gpu_id, args=args)
+        agent = agent_class(args.env.state_dim, args.env.action_dim, gpu_id=args.sys.worker_gpu_id, args=args)
         if args.train.continue_train:
             agent.save_or_load_agent(args.eval.cwd, if_save=False)
 
         #! 定向config 从这里改起点
         """init agent.last_state"""
-        state, info_dict = env.reset()
+        state, info_dict = env.reset(mode="train")
         if args.env.num_envs == 1:
             assert state.shape == (args.env.state_dim,)
             assert isinstance(state, np.ndarray)
@@ -462,34 +514,50 @@ class Worker(Process):
 
         """init buffer"""
         horizon_len = args.train.horizon_len
-
+        if_use_onnx = args.agent.actor.onnx_session
         """loop"""
-        del args
-        # import time  #!
+        #import time  #!
         th.set_num_threads(1)
         from threadpoolctl import threadpool_limits
 
         with threadpool_limits(limits=1, user_api="blas"):
             while True:
                 """Worker receive actor from Learner"""
-                actor = self.recv_pipe.recv()
+                actor, task_config = self.recv_pipe.recv() #! 这里需要接受总step？或者根据下面的buffer直接算？
                 if actor is None:
                     break
-                agent.act = (
-                    actor.to(agent.device) if os.name == "nt" else actor
-                )  # WindowsNT_OS can only send cpu_tensor
-
-                agent.act.train()
-
+                agent.act = actor.to(agent.device)
+                #agent.act.train() #! 这里不需要开启train，同时可以用onne加速
+                if if_use_onnx and agent.device==th.device("cpu"):
+                    import io
+                    import onnxruntime as ort
+                    onnx_buffer = io.BytesIO()
+                    dummy_state = th.zeros((1, args.env.state_dim), dtype=th.float32, device=agent.device)
+                    th.onnx.export(
+                        actor.net, 
+                        (dummy_state,), 
+                        onnx_buffer, # type: ignore
+                        input_names=['state'], 
+                        output_names=['logits']
+                    )
+                    
+                    sess_options = ort.SessionOptions()
+                    sess_options.intra_op_num_threads = 1
+                    sess_options.inter_op_num_threads = 1
+                    
+                    actor.onnx_session = ort.InferenceSession(onnx_buffer.getvalue(), sess_options, providers=['CPUExecutionProvider'])
+                else:
+                    actor.onnx_session = None
                 # t0 = time.time()  #!
                 """Worker send the training data to Learner"""
-                #! 定向config 这里传入除起点外剩下的case 绝对id来运行,explore_env最后可添加tasj_config参数
-                buffer_items = agent.explore_env(env, horizon_len)
+                #! 定向config 这里传入除起点外剩下的case 绝对id来运行,explore_env最后可添加task_config参数
+                buffer_items = agent.explore_env(env, horizon_len, task_config=task_config) #  def _explore_one_env(self, env, horizon_len: int, task_config: Optional[Dict] = None) -> Tuple[TEN, ...]:
                 last_state = agent.last_state
                 if os.name == "nt":  # WindowsNT_OS can only send cpu_tensor
                     buffer_items = [t.cpu() for t in buffer_items]
                     last_state = deepcopy(last_state).cpu()
                 self.send_pipe.send((worker_id, buffer_items, last_state))
+                self.cum_step += self.step_num
                 # t1 = time.time()  #!
                 # print(f"| Worker-{worker_id} Explore Time: {t1 - t0:.3f}s", flush=True)  #!
 
@@ -511,13 +579,13 @@ class EvaluatorProc(Process):
         """init evaluator"""
         eval_env_class = get_class(args.eval.env._target_)
         eval_env_cfg = args.eval.env
-        eval_env = build_env(eval_env_class, eval_env_cfg, args.sys.gpu_id)
+        eval_env = build_env(eval_env_class, eval_env_cfg, args.sys.worker_gpu_id)
         evaluator = Evaluator(cwd=args.eval.cwd, env=eval_env, args=args, if_tensorboard=True)
 
         """loop"""
         cwd = args.eval.cwd
         break_step = args.train.break_step
-        device = th.device(f"cuda:{args.sys.gpu_id}" if (th.cuda.is_available() and (args.sys.gpu_id >= 0)) else "cpu")
+        device = th.device(f"cuda:{args.sys.worker_gpu_id}" if (th.cuda.is_available() and (args.sys.worker_gpu_id >= 0)) else "cpu")
         del args
 
         if_train = True
@@ -530,7 +598,7 @@ class EvaluatorProc(Process):
             if actor is None:
                 evaluator.total_step += steps  # update total_step but don't update recorder
             else:
-                actor = actor.to(device) if os.name == "nt" else actor  # WindowsNT_OS can only send cpu_tensor
+                actor = actor.to(device)
                 actor.eval()
                 evaluator.evaluate_and_save(actor=actor, steps=steps, exp_r=exp_r, logging_dict=logging_dict)
 
